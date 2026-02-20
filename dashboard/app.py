@@ -16,8 +16,11 @@ if not DATABASE_URL:
 @st.cache_data(ttl=30)
 def read_df(query: str, params=None) -> pd.DataFrame:
     with psycopg.connect(DATABASE_URL) as conn:
-        return pd.read_sql(query, conn, params=params)
-
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            cols = [c.name for c in cur.description]
+            rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=cols)
 
 def compute_drawdown(equity: pd.Series) -> pd.Series:
     peak = equity.cummax()
