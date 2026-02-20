@@ -1,0 +1,5 @@
+ccxt==4.5.1
+pandas==2.2.2
+numpy==2.0.1
+psycopg[binary]==3.2.1
+python-dotenv==1.0.1
