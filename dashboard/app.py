@@ -3,6 +3,7 @@ import pandas as pd
 import psycopg
 import streamlit as st
 import plotly.express as px
+import ccxt
 
 st.set_page_config(page_title="Crypto Bot Dashboard", layout="wide")
 
@@ -20,8 +21,57 @@ def read_df(query: str, params=None) -> pd.DataFrame:
 
 def compute_drawdown(equity: pd.Series) -> pd.Series:
     peak = equity.cummax()
-    dd = (equity / peak) - 1.0
-    return dd
+    return (equity / peak) - 1.0
+
+
+@st.cache_data(ttl=300)  # 5 min
+def get_usdc_to_eur_rate() -> tuple[float, str]:
+    """
+    Devuelve (eur_per_usdc, source)
+    Prioridad:
+      1) env FX_USDC_EUR (manual override)
+      2) Binance via ccxt (public)
+      3) fallback 0.92
+    """
+    env_fx = os.environ.get("FX_USDC_EUR")
+    if env_fx:
+        try:
+            v = float(env_fx)
+            if v > 0:
+                return v, "env(FX_USDC_EUR)"
+        except Exception:
+            pass
+
+    ex = ccxt.binance({"enableRateLimit": True})
+
+    # intentamos pares directos/inversos
+    candidates = [
+        ("USDC/EUR", "direct_usdc_eur"),     # price = EUR por 1 USDC
+        ("EUR/USDC", "inverse_eur_usdc"),    # price = USDC por 1 EUR => eur/usdc = 1/price
+        ("USDT/EUR", "direct_usdt_eur"),     # approx USDC
+        ("EUR/USDT", "inverse_eur_usdt"),    # eur/usdc approx 1/price
+    ]
+
+    for sym, mode in candidates:
+        try:
+            t = ex.fetch_ticker(sym)
+            last = t.get("last")
+            if not last:
+                continue
+            last = float(last)
+            if last <= 0:
+                continue
+
+            if mode.startswith("direct"):
+                # last ya es EUR por 1 USDC/USDT
+                return last, f"binance:{sym}"
+            else:
+                # last es USDC/USDT por 1 EUR => eur/usdc = 1/last
+                return 1.0 / last, f"binance:{sym} (inverted)"
+        except Exception:
+            continue
+
+    return 0.92, "fallback(0.92)"
 
 
 def kpi_block(label: str, value: str, help_text: str | None = None):
@@ -35,13 +85,21 @@ st.title("📈 Crypto Bot Dashboard")
 # -----------------------
 st.sidebar.header("Filtros")
 days = st.sidebar.selectbox("Ventana (días)", [7, 14, 30, 60, 90, 180, 365], index=2)
+
 symbols = read_df("SELECT DISTINCT symbol FROM signals ORDER BY symbol")["symbol"].tolist()
 symbols_sel = st.sidebar.multiselect("Símbolos", symbols, default=symbols)
 
 st.sidebar.divider()
+show_eur = st.sidebar.toggle("Mostrar EUR aproximado", value=True)
+
 auto_refresh = st.sidebar.toggle("Auto-refresh (cada 30s)", value=True)
 if auto_refresh:
     st.cache_data.clear()
+
+# -----------------------
+# FX
+# -----------------------
+eur_per_usdc, fx_src = get_usdc_to_eur_rate()
 
 # -----------------------
 # Load core tables
@@ -103,7 +161,7 @@ positions_f = positions[positions["symbol"].isin(symbols_sel)] if len(symbols_se
 # -----------------------
 # KPIs
 # -----------------------
-colA, colB, colC, colD, colE = st.columns(5)
+colA, colB, colC, colD, colE, colF = st.columns(6)
 
 if not equity.empty:
     eq0 = float(equity["equity_usdc"].iloc[0])
@@ -116,15 +174,21 @@ else:
     ret = 0.0
     mdd = 0.0
 
+eqN_eur = eqN * eur_per_usdc
+
 n_trades = len(trades)
 n_buys = int((trades["side"] == "buy").sum()) if n_trades else 0
 n_sells = int((trades["side"] == "sell").sum()) if n_trades else 0
 
 kpi_block("Equity actual (USDC)", f"{eqN:,.2f}")
+kpi_block("Equity aprox (EUR)", f"{eqN_eur:,.2f}", help_text=f"FX: {eur_per_usdc:.6f} EUR/USDC ({fx_src})" if show_eur else None)
 kpi_block("Retorno ventana", f"{ret*100:,.2f}%")
 kpi_block("Max Drawdown", f"{mdd*100:,.2f}%")
 kpi_block("Trades (ventana)", f"{n_trades}")
 kpi_block("BUY/SELL", f"{n_buys}/{n_sells}")
+
+if show_eur:
+    st.caption(f"Conversión aprox: 1 USDC ≈ {eur_per_usdc:.6f} EUR  ·  Fuente: {fx_src}")
 
 st.divider()
 
@@ -136,9 +200,19 @@ c1, c2 = st.columns([2, 1])
 with c1:
     st.subheader("Equity curve")
     if equity.empty:
-        st.info("Sin datos en equity_snapshots aún.")
+        st.info("Sin datos en equity_snapshots aún. Ejecuta el bot al menos una vez tras el reset.")
     else:
-        fig = px.line(equity, x="day", y="equity_usdc")
+        eq_plot = equity.copy()
+        metric = st.radio("Unidad", ["USDC", "EUR (aprox)"] if show_eur else ["USDC"], horizontal=True)
+        if metric.startswith("EUR"):
+            eq_plot["equity"] = eq_plot["equity_usdc"] * eur_per_usdc
+            ycol = "equity"
+            ytitle = "equity (EUR aprox)"
+        else:
+            ycol = "equity_usdc"
+            ytitle = "equity (USDC)"
+
+        fig = px.line(eq_plot, x="day", y=ycol, labels={ycol: ytitle, "day": "día"})
         fig.update_layout(height=360, margin=dict(l=10, r=10, t=40, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
@@ -147,9 +221,9 @@ with c2:
     if equity.empty:
         st.info("Sin datos.")
     else:
-        dd = equity.copy()
-        dd["drawdown"] = compute_drawdown(dd["equity_usdc"])
-        fig = px.area(dd, x="day", y="drawdown")
+        dd_df = equity.copy()
+        dd_df["drawdown"] = compute_drawdown(dd_df["equity_usdc"])
+        fig = px.area(dd_df, x="day", y="drawdown", labels={"drawdown": "drawdown", "day": "día"})
         fig.update_layout(height=360, margin=dict(l=10, r=10, t=40, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
@@ -162,8 +236,8 @@ c3, c4 = st.columns([1, 2])
 
 with c3:
     st.subheader("Positions (BOT)")
-    if positions_f.empty:
-        st.info("Sin posiciones.")
+    if positions_f.empty or (positions_f["qty"].fillna(0).abs().sum() == 0):
+        st.info("Sin posiciones (qty=0).")
     else:
         st.dataframe(positions_f, use_container_width=True, hide_index=True)
 
@@ -172,10 +246,8 @@ with c4:
     if signals.empty:
         st.info("Sin señales.")
     else:
-        # last day per symbol
         latest_day = signals["day"].max()
-        latest = signals[signals["day"] == latest_day].copy()
-        latest = latest.sort_values("symbol")
+        latest = signals[signals["day"] == latest_day].copy().sort_values("symbol")
         st.caption(f"Día: {latest_day}")
         st.dataframe(
             latest[["symbol", "regime_on", "entry_signal", "exit_signal", "close", "sma200", "atr14"]],
@@ -209,4 +281,4 @@ with c6:
     st.subheader("Settings")
     st.dataframe(settings, use_container_width=True, hide_index=True)
 
-st.caption("Tip: si ves 'DISABLED' en runs, trading_enabled=false. Si ves trades pero no cambian posiciones, hay bug en set_bot_position.")
+st.caption("Tip: si ves trades pero positions no cambia, revisa set_bot_position. Si ves DISABLED, trading_enabled=false.")
