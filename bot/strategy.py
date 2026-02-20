@@ -41,11 +41,12 @@ def decide(df: pd.DataFrame, symbol: str | None = None):
     Devuelve dict con:
       regime_on, entry_signal, exit_signal y valores actuales
 
-    MODO TEST (por env vars):
+    MODO TEST (env vars):
       TEST_MODE=true habilita el harness.
-      TEST_FORCE_REGIME_ON=true fuerza regime_on=True (ignora SMA200).
+      TEST_FORCE_REGIME_ON=true fuerza regime_on=True.
       TEST_FORCE_ENTRY_SYMBOL="BTC/USDC" fuerza entry_signal=True para ese símbolo.
       TEST_FORCE_EXIT_SYMBOL="BTC/USDC" fuerza exit_signal=True para ese símbolo.
+      TEST_IGNORE_EXIT=true ignora el exit natural cuando estás forzando entrada.
     """
     row = df.iloc[-1]
 
@@ -69,6 +70,7 @@ def decide(df: pd.DataFrame, symbol: str | None = None):
     test_mode = _env_flag("TEST_MODE", "false")
     if test_mode:
         force_regime = _env_flag("TEST_FORCE_REGIME_ON", "false")
+        ignore_exit = _env_flag("TEST_IGNORE_EXIT", "false")
         force_entry_sym = os.environ.get("TEST_FORCE_ENTRY_SYMBOL", "").strip()
         force_exit_sym = os.environ.get("TEST_FORCE_EXIT_SYMBOL", "").strip()
 
@@ -79,13 +81,17 @@ def decide(df: pd.DataFrame, symbol: str | None = None):
         if not regime_on:
             entry_signal = False
 
-        if symbol and force_entry_sym and symbol == force_entry_sym:
-            entry_signal = True
-
+        # Forzar EXIT explícito
         if symbol and force_exit_sym and symbol == force_exit_sym:
             exit_signal = True
 
-        # Si forzamos exit, exit manda
+        # Forzar ENTRY explícito (y opcionalmente ignorar exit natural)
+        if symbol and force_entry_sym and symbol == force_entry_sym:
+            if ignore_exit:
+                exit_signal = False
+            entry_signal = True
+
+        # Si exit está forzado (o queda true), exit manda y entry se apaga
         if exit_signal:
             entry_signal = False
 
