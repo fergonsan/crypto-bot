@@ -54,8 +54,8 @@ def orders_today_count(conn, day: dt.date) -> int:
 def get_bot_equity_usdc(conn, ex, symbols: list[str]) -> float:
     """
     Equity del BOT (no de tu cuenta completa):
-      - USDC libre + USDC bloqueado (total)
-      - + valor de las posiciones del BOT (tabla positions) marcadas a precio last
+      - USDC total
+      - + valor de las posiciones del BOT (tabla positions) a precio last
     """
     bal = ex.fetch_balance()
     usdc_total = float(bal["total"].get("USDC", 0.0) or 0.0)
@@ -86,14 +86,14 @@ def main():
         ex = make_exchange()
         ex.load_markets()
 
-        # Validación de allowlist (seguridad)
+        # Validación allowlist
         for s in SYMBOLS:
             if s not in ALLOWLIST:
                 raise RuntimeError(f"Symbol {s} fuera de allowlist.")
 
         today = dt.datetime.utcnow().date()
 
-        # --- equity snapshot (del BOT) ---
+        # Equity snapshot (del BOT)
         bot_equity = get_bot_equity_usdc(conn, ex, SYMBOLS)
         with conn.cursor() as cur:
             cur.execute(
@@ -103,21 +103,28 @@ def main():
             )
         conn.commit()
 
-        msgs = []
-        msgs.append(
-            f"🧠 Bot run {today} | bot_equity~{bot_equity:.2f} USDC | "
-            f"{'LIVE' if (trading_enabled and not DRY_RUN) else ('PAPER' if trading_enabled else 'DISABLED')} | "
-            f"DRY_RUN={DRY_RUN}"
+        mode_str = (
+            "LIVE" if (trading_enabled and not DRY_RUN)
+            else ("PAPER" if trading_enabled else "DISABLED")
         )
 
-        # --- Si está deshabilitado, SOLO señales (y salimos del loop de trading) ---
-        # Esto garantiza: con trading_enabled=false NO se insertan trades ni se tocan posiciones.
+        msgs = []
+        msgs.append(
+            f"🧠 Bot run {today} | bot_equity~{bot_equity:.2f} USDC | {mode_str} | DRY_RUN={DRY_RUN}"
+        )
+
+        # ============================
+        # 1) SIEMPRE: calcular y guardar señales
+        # ============================
+        daily_signals = {}
+
         for symbol in SYMBOLS:
             df = fetch_ohlcv_df(ex, symbol, limit=400)
             df = compute_indicators(df)
-            d = decide(df)
+            d = decide(df, symbol)  # <- IMPORTANTE: symbol aquí
 
-            # Guarda señal siempre
+            daily_signals[symbol] = d
+
             with conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO signals(day,symbol,regime_on,entry_signal,exit_signal,close,sma200,donchian_high20,donchian_low10,atr14)
@@ -149,18 +156,21 @@ def main():
 
             close_str = f"{d['close']:.2f}" if d["close"] is not None else "NA"
             sma200_str = f"{d['sma200']:.2f}" if d["sma200"] is not None else "NA"
-
             msgs.append(
                 f"• {symbol}: regime={'ON' if d['regime_on'] else 'OFF'} "
-                f"entry={d['entry_signal']} exit={d['exit_signal']} "
-                f"close={close_str} sma200={sma200_str}"
+                f"entry={d['entry_signal']} exit={d['exit_signal']} close={close_str} sma200={sma200_str}"
             )
+
+        # Si está deshabilitado: solo señales
         if not trading_enabled:
             telegram_send("\n".join(msgs))
             set_run_status(conn, run_id, "ok", "signals_only_trading_disabled")
             return
 
-        # --- Si trading_enabled=true, aplicamos límites globales antes de operar ---
+        # ============================
+        # 2) TRADING (paper o live)
+        # ============================
+
         if orders_today_count(conn, today) >= max_orders_per_day:
             msgs.append(f"🟡 Límite de órdenes/día alcanzado ({max_orders_per_day}). No opera hoy.")
             telegram_send("\n".join(msgs))
@@ -170,25 +180,21 @@ def main():
         bal = ex.fetch_balance()
         quote_free = float(bal["free"].get("USDC", 0.0) or 0.0)
 
-        # --- Trading loop (solo posiciones DEL BOT, no del balance de la cuenta) ---
         for symbol in SYMBOLS:
-            df = fetch_ohlcv_df(ex, symbol, limit=400)
-            df = compute_indicators(df)
-            d = decide(df)
-
+            d = daily_signals[symbol]  # usamos lo ya calculado
             close = d["close"]
             atr14 = d["atr14"]
 
+            # Posición del BOT (NO del balance real)
             bot_qty = get_bot_position_qty(conn, symbol)
 
-            # Exposición bot actual en ese activo
             exposure_value = (bot_qty * close) if (bot_qty > 0 and close) else 0.0
             exposure_pct = (exposure_value / bot_equity) if bot_equity > 0 else 0.0
 
-            # --- EXIT ---
+            # EXIT
             if bot_qty > 0 and d["exit_signal"]:
                 executed = (not DRY_RUN)
-                # En PAPER (DRY_RUN=true) no enviamos orden; en LIVE sí.
+
                 if executed:
                     order = ex.create_market_sell_order(symbol, bot_qty)
                     price = float(order.get("average") or close or 0.0)
@@ -197,7 +203,6 @@ def main():
 
                 notional = bot_qty * price
 
-                # Registramos trade (paper o live)
                 with conn.cursor() as cur:
                     cur.execute(
                         "INSERT INTO trades(symbol,side,qty,price,notional,reason) VALUES(%s,'sell',%s,%s,%s,%s)",
@@ -205,7 +210,6 @@ def main():
                     )
                 conn.commit()
 
-                # Actualizamos posición BOT a 0 (paper o live)
                 set_bot_position(conn, symbol, 0.0, None)
 
                 msgs.append(
@@ -214,33 +218,30 @@ def main():
                 )
                 continue
 
-            # --- ENTRY ---
+            # ENTRY
             if bot_qty == 0 and d["entry_signal"]:
                 if not atr14 or not close:
                     msgs.append(f"⚪ {symbol}: señal entrada pero sin ATR/close válido.")
                     continue
 
-                # tamaño por riesgo 1%
+                # 1% de riesgo con stop 2*ATR
                 qty = position_size_usdc(bot_equity, 0.01, atr14, close)
 
                 # hard limit por notional
-                qty_by_notional = max_order_notional / close
-                qty = min(qty, qty_by_notional)
+                qty = min(qty, max_order_notional / close)
 
                 # hard limit por exposición %
-                max_exposure_value = bot_equity * max_asset_exposure_pct
-                qty_by_exposure = max_exposure_value / close
-                qty = min(qty, qty_by_exposure)
+                qty = min(qty, (bot_equity * max_asset_exposure_pct) / close)
 
-                # no comprar si no hay USDC libre suficiente
-                max_affordable_qty = quote_free / close if close > 0 else 0.0
-                qty = min(qty, max_affordable_qty)
+                # hard limit por USDC libre
+                qty = min(qty, (quote_free / close) if close > 0 else 0.0)
 
                 if qty <= 0:
                     msgs.append(f"⚪ {symbol}: señal entrada pero qty=0 (límites o falta de USDC libre).")
                     continue
 
                 executed = (not DRY_RUN)
+
                 if executed:
                     order = ex.create_market_buy_order(symbol, qty)
                     price = float(order.get("average") or close)
@@ -249,7 +250,6 @@ def main():
 
                 notional = qty * price
 
-                # Registramos trade (paper o live)
                 with conn.cursor() as cur:
                     cur.execute(
                         "INSERT INTO trades(symbol,side,qty,price,notional,reason) VALUES(%s,'buy',%s,%s,%s,%s)",
@@ -257,10 +257,9 @@ def main():
                     )
                 conn.commit()
 
-                # Actualizamos posición BOT (paper o live)
                 set_bot_position(conn, symbol, float(qty), float(price))
 
-                # Reducimos quote_free en papel para no “comprar dos veces” en el mismo run
+                # consumir USDC libre en papel para evitar doble compra en el mismo run
                 quote_free -= notional
 
                 msgs.append(
