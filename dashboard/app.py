@@ -23,8 +23,9 @@ def read_df(query: str, params=None) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=cols)
 
 def compute_drawdown(equity: pd.Series) -> pd.Series:
-    peak = equity.cummax()
-    return (equity / peak) - 1.0
+    eq = pd.to_numeric(equity, errors="coerce").astype(float)
+    peak = eq.cummax()
+    return (eq / peak) - 1.0
 
 
 @st.cache_data(ttl=300)  # 5 min
@@ -116,6 +117,9 @@ equity = read_df(
     """,
     params=(days,),
 )
+
+if not equity.empty:
+    equity["equity_usdc"] = pd.to_numeric(equity["equity_usdc"], errors="coerce").astype(float)
 
 trades = read_df(
     """
