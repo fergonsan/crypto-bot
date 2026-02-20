@@ -147,12 +147,14 @@ def main():
                 )
             conn.commit()
 
+            close_str = f"{d['close']:.2f}" if d["close"] is not None else "NA"
+            sma200_str = f"{d['sma200']:.2f}" if d["sma200"] is not None else "NA"
+
             msgs.append(
                 f"• {symbol}: regime={'ON' if d['regime_on'] else 'OFF'} "
                 f"entry={d['entry_signal']} exit={d['exit_signal']} "
-                f"close={d['close']:.2f if d['close'] else None} sma200={d['sma200']:.2f if d['sma200'] else None}"
+                f"close={close_str} sma200={sma200_str}"
             )
-
         if not trading_enabled:
             telegram_send("\n".join(msgs))
             set_run_status(conn, run_id, "ok", "signals_only_trading_disabled")
