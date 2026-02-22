@@ -7,8 +7,10 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.venv_bt/
 venv/
 env/
+
 
 # VSCode
 .vscode/
