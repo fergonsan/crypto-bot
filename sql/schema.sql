@@ -99,4 +99,10 @@ CREATE TABLE equity_snapshots (
   equity_usdc NUMERIC NOT NULL
 );
 
+ALTER TABLE positions
+  ADD COLUMN IF NOT EXISTS entry_time timestamptz,
+  ADD COLUMN IF NOT EXISTS peak_close double precision DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS hard_stop double precision DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS trail_stop double precision DEFAULT 0;
+
 COMMIT;

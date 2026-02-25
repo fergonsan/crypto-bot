@@ -1,205 +1,137 @@
 """
-BOT PRINCIPAL DE TRADING
-=========================
+DAILY BOT (V3)
+==============
+- Señales 1d cerradas
+- Entries/Exits por señal
+- Actualiza hard/trailing stops en BD
+- Fallback: stop por CLOSE diario (por si el intraday no corre)
 
-Este es el archivo principal que ejecuta el bot de trading.
-Se ejecuta periódicamente (típicamente una vez al día mediante cron).
-
-FLUJO DE EJECUCIÓN:
-1. Conecta a la base de datos y crea un registro de ejecución
-2. Lee configuración desde la base de datos (settings)
-3. Calcula señales para todos los símbolos configurados
-4. Si trading está habilitado, ejecuta órdenes según las señales
-5. Envía notificaciones por Telegram
-6. Registra todo en la base de datos
-
-CONFIGURACIÓN:
-- SYMBOLS: Pares a operar (ej: "BTC/USDC,ETH/USDC")
-- TIMEFRAME: Timeframe de las velas (ej: "1d" para diario)
-- DRY_RUN: Si es "true", no ejecuta órdenes reales (solo simula)
-
-CONFIGURACIÓN EN BASE DE DATOS (tabla settings):
-- trading_enabled: "true" para habilitar trading, "false" para solo calcular señales
-- max_order_notional_usdc: Máximo valor de una orden en USDC
-- max_asset_exposure_pct: Máximo % del equity que puede estar en un solo activo
-- max_orders_per_day: Máximo número de órdenes por día
+Lock:
+- Usa advisory lock "bot_daily" para evitar concurrente.
 """
 
 import os
 import datetime as dt
 import pandas as pd
 
-from db import get_conn, get_setting, create_run, set_run_status
+from db import get_conn, get_setting, create_run, set_run_status, try_advisory_lock, release_advisory_lock
 from binance_client import make_exchange
 from strategy import compute_indicators, decide
 from risk import position_size_usdc
 from notifier import telegram_send
 
-# ============================================
-# CONFIGURACIÓN DESDE VARIABLES DE ENTORNO
-# ============================================
-# ⚠️ MODIFICAR AQUÍ: Cambia estos valores para operar otros pares o timeframes
-SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "BTC/USDC,ETH/USDC").split(",")]
-TIMEFRAME = os.environ.get("TIMEFRAME", "1d")  # "1d" = diario, "4h" = 4 horas, etc.
-DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"  # "true" = simulación, "false" = órdenes reales
 
-# Lista de seguridad: solo permite operar símbolos en esta lista
+SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "BTC/USDC,ETH/USDC").split(",") if s.strip()]
+TIMEFRAME = os.environ.get("TIMEFRAME", "1d")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+os.environ.setdefault("DONCH_ENTRY", "55")
+os.environ.setdefault("DONCH_EXIT", "20")
+
+RISK_PER_TRADE = float(os.environ.get("RISK_PER_TRADE", "0.02"))
+HARD_STOP_ATR_MULT = float(os.environ.get("HARD_STOP_ATR_MULT", "1.5"))
+TRAIL_ATR_MULT = float(os.environ.get("TRAIL_ATR_MULT", "3.0"))
+
 ALLOWLIST = set(SYMBOLS)
 
 
-def fetch_ohlcv_df(ex, symbol: str, limit: int = 400) -> pd.DataFrame:
-    """
-    Obtiene datos históricos OHLCV (Open, High, Low, Close, Volume) desde Binance.
-    
-    Args:
-        ex: Instancia del exchange (Binance)
-        symbol: Par a consultar (ej: "BTC/USDC")
-        limit: Número de velas a obtener (por defecto 400)
-    
-    Returns:
-        DataFrame con columnas: ts, open, high, low, close, volume
-    """
+def fetch_ohlcv_df(ex, symbol: str, limit: int = 500) -> pd.DataFrame:
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     return df
 
 
-def get_bot_position_qty(conn, symbol: str) -> float:
-    """
-    Obtiene la cantidad de un activo que tiene el bot en posición.
-    
-    NOTA: Esta es la posición del BOT (registrada en la BD), no necesariamente
-    la posición real en Binance. El bot mantiene su propio registro de posiciones.
-    
-    Args:
-        conn: Conexión a la base de datos
-        symbol: Par a consultar (ej: "BTC/USDC")
-    
-    Returns:
-        Cantidad del activo (0.0 si no hay posición)
-    """
+def get_bot_position(conn, symbol: str) -> dict | None:
     with conn.cursor() as cur:
-        cur.execute("SELECT qty FROM positions WHERE symbol=%s", (symbol,))
+        cur.execute(
+            "SELECT symbol, qty, avg_price, entry_time, peak_close, hard_stop, trail_stop "
+            "FROM positions WHERE symbol=%s",
+            (symbol,),
+        )
         row = cur.fetchone()
-        return float(row[0]) if row else 0.0
+        if not row:
+            return None
+        return {
+            "symbol": row[0],
+            "qty": float(row[1] or 0.0),
+            "entry_price": float(row[2] or 0.0),
+            "entry_time": row[3],
+            "peak_close": float(row[4] or 0.0),
+            "hard_stop": float(row[5] or 0.0),
+            "trail_stop": float(row[6] or 0.0),
+        }
 
 
-def set_bot_position(conn, symbol: str, qty: float, avg_price: float | None = None):
-    """
-    Actualiza o crea el registro de posición del bot en la base de datos.
-    
-    Args:
-        conn: Conexión a la base de datos
-        symbol: Par a actualizar (ej: "BTC/USDC")
-        qty: Cantidad del activo (0.0 para cerrar posición)
-        avg_price: Precio promedio de entrada (None para cerrar posición)
-    """
+def upsert_bot_position(conn, symbol: str, qty: float, entry_price: float | None,
+                        entry_time=None, peak_close: float = 0.0, hard_stop: float = 0.0, trail_stop: float = 0.0):
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO positions(symbol, qty, avg_price, updated_at)
-            VALUES(%s, %s, %s, NOW())
+            INSERT INTO positions(symbol, qty, avg_price, entry_time, peak_close, hard_stop, trail_stop, updated_at)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,NOW())
             ON CONFLICT(symbol) DO UPDATE SET
               qty=EXCLUDED.qty,
               avg_price=EXCLUDED.avg_price,
+              entry_time=EXCLUDED.entry_time,
+              peak_close=EXCLUDED.peak_close,
+              hard_stop=EXCLUDED.hard_stop,
+              trail_stop=EXCLUDED.trail_stop,
               updated_at=NOW()
             """,
-            (symbol, qty, avg_price),
+            (symbol, qty, entry_price, entry_time, peak_close, hard_stop, trail_stop),
         )
     conn.commit()
 
 
 def orders_today_count(conn, day: dt.date) -> int:
-    """
-    Cuenta cuántas órdenes se han ejecutado hoy.
-    
-    Se usa para respetar el límite de órdenes por día (max_orders_per_day).
-    
-    Args:
-        conn: Conexión a la base de datos
-        day: Fecha a consultar
-    
-    Returns:
-        Número de órdenes ejecutadas ese día
-    """
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM trades WHERE created_at::date=%s", (day,))
         return int(cur.fetchone()[0])
 
 
 def get_bot_equity_usdc(conn, ex, symbols: list[str]) -> float:
-    """
-    Calcula el equity total del BOT en USDC.
-    
-    El equity incluye:
-    - USDC disponible en la cuenta
-    - + Valor de las posiciones abiertas del bot (a precio de mercado actual)
-    
-    NOTA: Este es el equity del BOT, no necesariamente de toda tu cuenta Binance.
-    El bot solo cuenta las posiciones que él mismo ha abierto.
-    
-    Args:
-        conn: Conexión a la base de datos
-        ex: Instancia del exchange
-        symbols: Lista de símbolos para calcular el valor de las posiciones
-    
-    Returns:
-        Equity total en USDC
-    """
     bal = ex.fetch_balance()
     usdc_total = float(bal["total"].get("USDC", 0.0) or 0.0)
 
     tickers = ex.fetch_tickers(symbols)
     equity = usdc_total
 
-    # Sumamos el valor de las posiciones abiertas del bot
     for sym in symbols:
         last = tickers.get(sym, {}).get("last")
         if not last:
             continue
-        qty = get_bot_position_qty(conn, sym)
-        equity += float(qty) * float(last)
+        pos = get_bot_position(conn, sym)
+        qty = float(pos["qty"]) if pos else 0.0
+        equity += qty * float(last)
 
     return float(equity)
 
 
 def main():
-    """
-    Función principal del bot.
-    
-    Esta función se ejecuta cada vez que el bot corre (típicamente una vez al día).
-    Realiza todo el flujo: cálculo de señales, ejecución de órdenes, registro en BD.
-    """
-    # Conectamos a la base de datos y creamos un registro de esta ejecución
     conn = get_conn()
     run_id = create_run(conn)
+    lock_key = "bot_daily"
 
     try:
-        # ============================================
-        # 1. LEER CONFIGURACIÓN DESDE BASE DE DATOS
-        # ============================================
-        # ⚠️ MODIFICAR AQUÍ: Cambia estos valores en la tabla 'settings' de la BD
+        if not try_advisory_lock(conn, lock_key):
+            set_run_status(conn, run_id, "ok", "lock_not_acquired")
+            return
+
         trading_enabled = get_setting(conn, "trading_enabled", "false").lower() == "true"
         max_order_notional = float(get_setting(conn, "max_order_notional_usdc", "300"))
         max_asset_exposure_pct = float(get_setting(conn, "max_asset_exposure_pct", "0.50"))
         max_orders_per_day = int(get_setting(conn, "max_orders_per_day", "2"))
 
-        # Conectamos a Binance
         ex = make_exchange()
         ex.load_markets()
 
-        # Validación de seguridad: solo permite operar símbolos en la allowlist
         for s in SYMBOLS:
             if s not in ALLOWLIST:
                 raise RuntimeError(f"Symbol {s} fuera de allowlist.")
 
         today = dt.datetime.utcnow().date()
 
-        # ============================================
-        # 2. CALCULAR EQUITY Y GUARDAR SNAPSHOT
-        # ============================================
-        # Calculamos el equity actual del bot y lo guardamos para seguimiento histórico
         bot_equity = get_bot_equity_usdc(conn, ex, SYMBOLS)
         with conn.cursor() as cur:
             cur.execute(
@@ -209,39 +141,22 @@ def main():
             )
         conn.commit()
 
-        # Determinar modo de operación para el mensaje
-        mode_str = (
-            "LIVE" if (trading_enabled and not DRY_RUN)
-            else ("PAPER" if trading_enabled else "DISABLED")
-        )
+        mode_str = ("LIVE" if (trading_enabled and not DRY_RUN) else ("PAPER" if trading_enabled else "DISABLED"))
+        msgs = [
+            f"🧠 DAILY {today} | equity~{bot_equity:.2f} USDC | {mode_str} | DRY_RUN={DRY_RUN}",
+            f"⚙️ V3: Donch={os.environ.get('DONCH_ENTRY')}/{os.environ.get('DONCH_EXIT')} "
+            f"risk={RISK_PER_TRADE:.4f} hardATR={HARD_STOP_ATR_MULT:.2f} trailATR={TRAIL_ATR_MULT:.2f}",
+        ]
 
-        # Preparar mensajes para Telegram
-        msgs = []
-        msgs.append(
-            f"🧠 Bot run {today} | bot_equity~{bot_equity:.2f} USDC | {mode_str} | DRY_RUN={DRY_RUN}"
-        )
-
-        # ============================================
-        # 3. CALCULAR SEÑALES PARA TODOS LOS SÍMBOLOS
-        # ============================================
-        # ⚠️ IMPORTANTE: Esto siempre se ejecuta, incluso si trading está deshabilitado
-        # Las señales se guardan en la BD para análisis histórico
-        
+        # Señales
         daily_signals = {}
-
         for symbol in SYMBOLS:
-            # Obtener datos históricos OHLCV
-            df = fetch_ohlcv_df(ex, symbol, limit=400)
-            
-            # Calcular indicadores técnicos (SMA200, Donchian, ATR, etc.)
+            df = fetch_ohlcv_df(ex, symbol, limit=500)
             df = compute_indicators(df)
-            
-            # Decidir señales de entrada/salida según la estrategia
-            d = decide(df, symbol)  # ← La función decide() está en strategy.py
-
+            d = decide(df, symbol)
             daily_signals[symbol] = d
 
-            # Guardar señales en la base de datos para análisis histórico
+            # legacy insert
             with conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO signals(day,symbol,regime_on,entry_signal,exit_signal,close,sma200,donchian_high20,donchian_low10,atr14)
@@ -256,84 +171,79 @@ def main():
                          donchian_low10=EXCLUDED.donchian_low10,
                          atr14=EXCLUDED.atr14
                     """,
-                    (
-                        today,
-                        symbol,
-                        d["regime_on"],
-                        d["entry_signal"],
-                        d["exit_signal"],
-                        d["close"],
-                        d["sma200"],
-                        d["donchian_high20"],
-                        d["donchian_low10"],
-                        d["atr14"],
-                    ),
+                    (today, symbol, d["regime_on"], d["entry_signal"], d["exit_signal"], d["close"],
+                     d["sma200"], d["donchian_high20"], d["donchian_low10"], d["atr14"]),
                 )
             conn.commit()
 
-            # Agregar información de señales al mensaje de Telegram
-            close_str = f"{d['close']:.2f}" if d["close"] is not None else "NA"
-            sma200_str = f"{d['sma200']:.2f}" if d["sma200"] is not None else "NA"
-            msgs.append(
-                f"• {symbol}: regime={'ON' if d['regime_on'] else 'OFF'} "
-                f"entry={d['entry_signal']} exit={d['exit_signal']} close={close_str} sma200={sma200_str}"
-            )
-
-        # Si trading está deshabilitado, solo enviamos las señales y terminamos
         if not trading_enabled:
             telegram_send("\n".join(msgs))
             set_run_status(conn, run_id, "ok", "signals_only_trading_disabled")
             return
 
-        # ============================================
-        # 4. EJECUTAR TRADING (PAPER O LIVE)
-        # ============================================
-        # Solo llegamos aquí si trading_enabled = true
-        
-        # Verificar límite de órdenes por día
         if orders_today_count(conn, today) >= max_orders_per_day:
-            msgs.append(f"🟡 Límite de órdenes/día alcanzado ({max_orders_per_day}). No opera hoy.")
+            msgs.append(f"🟡 max_orders_per_day alcanzado ({max_orders_per_day}).")
             telegram_send("\n".join(msgs))
             set_run_status(conn, run_id, "ok", "max_orders_per_day reached")
             return
 
-        # Obtener balance disponible en USDC
         bal = ex.fetch_balance()
         quote_free = float(bal["free"].get("USDC", 0.0) or 0.0)
 
-        # Procesar cada símbolo
         for symbol in SYMBOLS:
-            # Usamos las señales ya calculadas anteriormente
             d = daily_signals[symbol]
             close = d["close"]
             atr14 = d["atr14"]
 
-            # Obtener posición actual del bot (desde la BD, no desde Binance)
-            bot_qty = get_bot_position_qty(conn, symbol)
+            pos = get_bot_position(conn, symbol)
+            bot_qty = float(pos["qty"]) if pos else 0.0
 
-            # Calcular exposición actual (% del equity en este activo)
-            exposure_value = (bot_qty * close) if (bot_qty > 0 and close) else 0.0
-            exposure_pct = (exposure_value / bot_equity) if bot_equity > 0 else 0.0
+            # Update stops + close-based stop fallback
+            if bot_qty > 0 and close and atr14:
+                peak_close = max(float(pos.get("peak_close") or 0.0), float(close))
+                trail_candidate = peak_close - (TRAIL_ATR_MULT * float(atr14))
+                trail_stop = max(float(pos.get("trail_stop") or 0.0), float(trail_candidate))
 
-            # ============================================
-            # LÓGICA DE SALIDA (EXIT)
-            # ============================================
-            # Si tenemos posición y hay señal de salida, vendemos
+                hard_stop = float(pos.get("hard_stop") or 0.0)
+                if hard_stop <= 0.0:
+                    hard_stop = float(pos["entry_price"]) - (HARD_STOP_ATR_MULT * float(atr14))
+
+                stop_level = max(hard_stop, trail_stop)
+
+                upsert_bot_position(conn, symbol, bot_qty, float(pos["entry_price"]),
+                                    entry_time=pos.get("entry_time"), peak_close=peak_close,
+                                    hard_stop=hard_stop, trail_stop=trail_stop)
+
+                if float(close) < stop_level:
+                    executed = (not DRY_RUN)
+                    if executed:
+                        order = ex.create_market_sell_order(symbol, bot_qty)
+                        price = float(order.get("average") or close or 0.0)
+                    else:
+                        price = float(close)
+
+                    notional = bot_qty * price
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO trades(symbol,side,qty,price,notional,reason) VALUES(%s,'sell',%s,%s,%s,%s)",
+                            (symbol, bot_qty, price, notional, "stop_close_daily"),
+                        )
+                    conn.commit()
+
+                    upsert_bot_position(conn, symbol, 0.0, None, entry_time=None, peak_close=0.0, hard_stop=0.0, trail_stop=0.0)
+                    msgs.append(f"🛑 STOP(daily close) {symbol} qty={bot_qty:.8f} px~{price:.4f} stop~{stop_level:.4f} ({'LIVE' if executed else 'PAPER'})")
+                    continue
+
+            # Exit por señal
             if bot_qty > 0 and d["exit_signal"]:
-                # Determinar si ejecutamos realmente o solo simulamos
                 executed = (not DRY_RUN)
-
                 if executed:
-                    # Orden real en Binance
                     order = ex.create_market_sell_order(symbol, bot_qty)
                     price = float(order.get("average") or close or 0.0)
                 else:
-                    # Simulación: usamos precio de cierre actual
                     price = float(close or 0.0)
 
                 notional = bot_qty * price
-
-                # Registrar la venta en la base de datos
                 with conn.cursor() as cur:
                     cur.execute(
                         "INSERT INTO trades(symbol,side,qty,price,notional,reason) VALUES(%s,'sell',%s,%s,%s,%s)",
@@ -341,61 +251,40 @@ def main():
                     )
                 conn.commit()
 
-                # Actualizar posición del bot a 0 (cerrada)
-                set_bot_position(conn, symbol, 0.0, None)
-
-                msgs.append(
-                    f"🔻 SELL {symbol} qty={bot_qty:.8f} price~{price:.4f} notional~{notional:.2f} "
-                    f"({'LIVE' if executed else 'PAPER'})"
-                )
+                upsert_bot_position(conn, symbol, 0.0, None, entry_time=None, peak_close=0.0, hard_stop=0.0, trail_stop=0.0)
+                msgs.append(f"🔻 SELL {symbol} qty={bot_qty:.8f} px~{price:.4f} ({'LIVE' if executed else 'PAPER'})")
                 continue
 
-            # ============================================
-            # LÓGICA DE ENTRADA (ENTRY)
-            # ============================================
-            # Si no tenemos posición y hay señal de entrada, compramos
+            # Entry
             if bot_qty == 0 and d["entry_signal"]:
-                # Validar que tenemos datos necesarios
                 if not atr14 or not close:
-                    msgs.append(f"⚪ {symbol}: señal entrada pero sin ATR/close válido.")
+                    msgs.append(f"⚪ {symbol}: entry pero sin ATR/close.")
                     continue
 
-                # ============================================
-                # CALCULAR TAMAÑO DE POSICIÓN
-                # ============================================
-                # ⚠️ MODIFICAR AQUÍ: Cambia el riesgo (0.01 = 1%) en risk.py
-                # El tamaño se calcula para arriesgar 1% del equity con stop a 2*ATR
-                qty = position_size_usdc(bot_equity, 0.01, atr14, close)
+                qty = position_size_usdc(bot_equity, RISK_PER_TRADE, float(atr14), float(close), hard_stop_atr_mult=HARD_STOP_ATR_MULT)
 
-                # Aplicar límites de seguridad (el más restrictivo gana)
-                # 1. Límite por valor máximo de orden
-                qty = min(qty, max_order_notional / close)
+                qty = min(qty, max_order_notional / float(close))
+                qty = min(qty, (bot_equity * max_asset_exposure_pct) / float(close))
+                qty = min(qty, (quote_free / float(close)) if float(close) > 0 else 0.0)
 
-                # 2. Límite por exposición máxima (% del equity en un solo activo)
-                qty = min(qty, (bot_equity * max_asset_exposure_pct) / close)
-
-                # 3. Límite por USDC disponible
-                qty = min(qty, (quote_free / close) if close > 0 else 0.0)
-
-                # Si después de los límites no queda cantidad, no operamos
                 if qty <= 0:
-                    msgs.append(f"⚪ {symbol}: señal entrada pero qty=0 (límites o falta de USDC libre).")
+                    msgs.append(f"⚪ {symbol}: entry pero qty=0 (límites/cash).")
                     continue
 
-                # Determinar si ejecutamos realmente o solo simulamos
                 executed = (not DRY_RUN)
-
                 if executed:
-                    # Orden real en Binance
                     order = ex.create_market_buy_order(symbol, qty)
                     price = float(order.get("average") or close)
                 else:
-                    # Simulación: usamos precio de cierre actual
                     price = float(close)
 
                 notional = qty * price
 
-                # Registrar la compra en la base de datos
+                entry_time = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+                hard_stop = float(price) - (HARD_STOP_ATR_MULT * float(atr14))
+                peak_close = float(price)
+                trail_stop = peak_close - (TRAIL_ATR_MULT * float(atr14))
+
                 with conn.cursor() as cur:
                     cur.execute(
                         "INSERT INTO trades(symbol,side,qty,price,notional,reason) VALUES(%s,'buy',%s,%s,%s,%s)",
@@ -403,37 +292,25 @@ def main():
                     )
                 conn.commit()
 
-                # Actualizar posición del bot
-                set_bot_position(conn, symbol, float(qty), float(price))
+                upsert_bot_position(conn, symbol, float(qty), float(price), entry_time=entry_time,
+                                    peak_close=peak_close, hard_stop=hard_stop, trail_stop=trail_stop)
 
-                # Consumir USDC libre en simulación para evitar doble compra en el mismo run
                 quote_free -= notional
-
-                msgs.append(
-                    f"🔺 BUY {symbol} qty={qty:.8f} price~{price:.4f} notional~{notional:.2f} "
-                    f"({'LIVE' if executed else 'PAPER'})"
-                )
+                msgs.append(f"🔺 BUY {symbol} qty={qty:.8f} px~{price:.4f} hard~{hard_stop:.4f} trail~{trail_stop:.4f} ({'LIVE' if executed else 'PAPER'})")
                 continue
 
-            # Si no hay señal de entrada ni salida, solo reportamos el estado
-            msgs.append(
-                f"• {symbol}: regime={'ON' if d['regime_on'] else 'OFF'} entry={d['entry_signal']} exit={d['exit_signal']} "
-                f"bot_pos={bot_qty:.8f} exposure={exposure_pct:.0%}"
-            )
-
-        # ============================================
-        # 5. ENVIAR NOTIFICACIONES Y FINALIZAR
-        # ============================================
         telegram_send("\n".join(msgs))
         set_run_status(conn, run_id, "ok", "completed")
 
     except Exception as e:
-        # En caso de error, notificar y registrar
-        telegram_send(f"🔴 Bot error: {type(e).__name__}: {e}")
+        telegram_send(f"🔴 DAILY error: {type(e).__name__}: {e}")
         set_run_status(conn, run_id, "error", f"{type(e).__name__}: {e}")
         raise
     finally:
-        # Siempre cerrar la conexión a la BD
+        try:
+            release_advisory_lock(conn, lock_key)
+        except Exception:
+            pass
         conn.close()
 
 
