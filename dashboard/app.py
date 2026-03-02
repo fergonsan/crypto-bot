@@ -776,23 +776,6 @@ with t2:
 
 st.subheader("Bot runs (últimos 50)")
 
-# Inc. 2: avisar si el cron corre demasiado frecuente para estrategia 1d
-if not bot_runs.empty:
-    recent_runs = bot_runs.head(10)
-    recent_runs = recent_runs.copy()
-    recent_runs["started_at"] = pd.to_datetime(recent_runs["started_at"], utc=True, errors="coerce")
-    if len(recent_runs) >= 2:
-        intervals = recent_runs["started_at"].dropna().diff().abs().dropna()
-        if not intervals.empty:
-            min_interval_min = intervals.min().total_seconds() / 60.0
-            if min_interval_min < 60:
-                st.warning(
-                    f"⚠️ **Cron muy frecuente**: el bot está corriendo cada ~{min_interval_min:.0f} min. "
-                    f"Para una estrategia 1d es suficiente con **1 vez al día** (daily bot) "
-                    f"+ intraday_stops cada 5-15 min solo si hay posición abierta. "
-                    f"Ajusta el cron en Railway para reducir llamadas innecesarias a Binance."
-                )
-
 st.dataframe(bot_runs, use_container_width=True, hide_index=True)
 
 st.caption(
