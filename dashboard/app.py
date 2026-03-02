@@ -4,6 +4,7 @@ import pandas as pd
 import psycopg
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 import ccxt
 
 st.set_page_config(page_title="Crypto Bot Dashboard", layout="wide")
@@ -98,12 +99,6 @@ class RoundTrip:
 
 
 def pair_round_trips(trades: pd.DataFrame, fee_bps: float, slippage_bps: float) -> pd.DataFrame:
-    """
-    Empareja BUY->SELL por símbolo (FIFO) suponiendo que el bot opera 'flat->in->flat' (una posición por símbolo).
-    Calcula PnL con:
-      - fee por cada lado: fee_bps (bps sobre notional)
-      - slippage por cada lado: slippage_bps (bps sobre precio)
-    """
     if trades.empty:
         return pd.DataFrame()
 
@@ -125,7 +120,6 @@ def pair_round_trips(trades: pd.DataFrame, fee_bps: float, slippage_bps: float) 
         side = str(r["side"]).lower()
 
         if side == "buy":
-            # si ya hay buy abierto, lo ignoramos (no debería pasar si estrategia flat->in->flat)
             open_buys[sym] = {
                 "id": int(r["id"]),
                 "time": r["created_at"],
@@ -140,8 +134,8 @@ def pair_round_trips(trades: pd.DataFrame, fee_bps: float, slippage_bps: float) 
             b = open_buys.pop(sym)
             qty = min(float(b["qty"]), float(r["qty"])) if float(r["qty"]) > 0 else float(b["qty"])
 
-            buy_price = float(b["price"]) * (1.0 + slip_rate)   # peor para nosotros
-            sell_price = float(r["price"]) * (1.0 - slip_rate)  # peor para nosotros
+            buy_price = float(b["price"]) * (1.0 + slip_rate)
+            sell_price = float(r["price"]) * (1.0 - slip_rate)
 
             buy_notional = qty * buy_price
             sell_notional = qty * sell_price
@@ -204,15 +198,13 @@ def perf_summary(roundtrips: pd.DataFrame) -> dict:
     net = float(roundtrips["net_pnl"].sum())
     avg_net = float(roundtrips["net_pnl"].mean())
     avg_win = float(wins["net_pnl"].mean()) if len(wins) else 0.0
-    avg_loss = float(losses["net_pnl"].mean()) if len(losses) else 0.0  # negativo
+    avg_loss = float(losses["net_pnl"].mean()) if len(losses) else 0.0
 
     gain = float(wins["net_pnl"].sum()) if len(wins) else 0.0
     pain = float((-losses["net_pnl"]).sum()) if len(losses) else 0.0
     profit_factor = (gain / pain) if pain > 0 else (float("inf") if gain > 0 else 0.0)
 
-    # expectancy por trade
     expectancy = (winrate * avg_win) + ((1.0 - winrate) * avg_loss)
-
     avg_hold_h = float(roundtrips["holding_hours"].mean()) if "holding_hours" in roundtrips else 0.0
 
     return {
@@ -227,6 +219,311 @@ def perf_summary(roundtrips: pd.DataFrame) -> dict:
         "expectancy": expectancy,
         "avg_hold_h": avg_hold_h,
     }
+
+
+# -----------------------
+# DIAGNÓSTICO DE SEÑALES
+# -----------------------
+def compute_signal_diagnosis(signals_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    A partir del histórico de señales, calcula para cada símbolo:
+    - Estado actual: régimen ON/OFF, señal de entrada, señal de salida
+    - Distancia % del close al Donchian High (qué tan lejos está del breakout)
+    - Distancia % del close al SMA200 (margen de régimen)
+    - Días consecutivos con régimen ON sin señal de entrada
+    - Días consecutivos con régimen OFF
+    - Cuándo fue la última señal de entrada
+    """
+    if signals_df.empty:
+        return pd.DataFrame()
+
+    df = signals_df.copy()
+    df["day"] = pd.to_datetime(df["day"])
+    df = df.sort_values(["symbol", "day"])
+
+    for col in ["close", "sma200", "donchian_high20", "atr14"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    results = []
+
+    for sym, grp in df.groupby("symbol"):
+        grp = grp.sort_values("day").reset_index(drop=True)
+        latest = grp.iloc[-1]
+
+        close = float(latest["close"]) if pd.notna(latest["close"]) else None
+        sma200 = float(latest["sma200"]) if pd.notna(latest["sma200"]) else None
+        donch_high = float(latest["donchian_high20"]) if pd.notna(latest["donchian_high20"]) else None
+        atr14 = float(latest["atr14"]) if pd.notna(latest["atr14"]) else None
+        regime_on = bool(latest["regime_on"]) if pd.notna(latest["regime_on"]) else False
+        entry_signal = bool(latest["entry_signal"]) if pd.notna(latest["entry_signal"]) else False
+        exit_signal = bool(latest["exit_signal"]) if pd.notna(latest["exit_signal"]) else False
+
+        # Distancia % al Donchian High (breakout)
+        dist_to_breakout_pct = None
+        if close and donch_high and donch_high > 0:
+            dist_to_breakout_pct = (close / donch_high - 1.0) * 100.0  # negativo = debajo, positivo = ya rompió
+
+        # Distancia % al SMA200 (régimen)
+        dist_to_sma200_pct = None
+        if close and sma200 and sma200 > 0:
+            dist_to_sma200_pct = (close / sma200 - 1.0) * 100.0  # positivo = régimen ON
+
+        # ¿Cuántos días lleva el régimen en su estado actual?
+        regime_streak = 0
+        for i in range(len(grp) - 1, -1, -1):
+            if bool(grp.iloc[i]["regime_on"]) == regime_on:
+                regime_streak += 1
+            else:
+                break
+
+        # ¿Cuándo fue la última señal de entrada?
+        entry_rows = grp[grp["entry_signal"] == True]
+        last_entry_date = entry_rows["day"].max() if not entry_rows.empty else None
+        days_since_last_entry = None
+        if last_entry_date is not None:
+            days_since_last_entry = (pd.Timestamp(latest["day"]) - pd.Timestamp(last_entry_date)).days
+
+        # ¿Cuántas veces ha estado cerca (dentro del 2%) del breakout en los últimos 30 días?
+        recent = grp.tail(30).copy()
+        recent["close_f"] = pd.to_numeric(recent["close"], errors="coerce")
+        recent["donch_f"] = pd.to_numeric(recent["donchian_high20"], errors="coerce")
+        recent["near"] = (
+            recent["close_f"].notna() &
+            recent["donch_f"].notna() &
+            (recent["donch_f"] > 0) &
+            ((recent["close_f"] / recent["donch_f"]) >= 0.98)
+        )
+        days_near_breakout_30d = int(recent["near"].sum())
+
+        # Histórico de distancia al breakout (últimos 60 días) para el gráfico
+        hist = grp.tail(60).copy()
+        hist["dist_pct"] = (
+            pd.to_numeric(hist["close"], errors="coerce") /
+            pd.to_numeric(hist["donchian_high20"], errors="coerce") - 1.0
+        ) * 100.0
+
+        results.append({
+            "symbol": sym,
+            "day": latest["day"],
+            "close": close,
+            "sma200": sma200,
+            "donch_high20": donch_high,
+            "atr14": atr14,
+            "regime_on": regime_on,
+            "entry_signal": entry_signal,
+            "exit_signal": exit_signal,
+            "dist_to_breakout_pct": dist_to_breakout_pct,
+            "dist_to_sma200_pct": dist_to_sma200_pct,
+            "regime_streak_days": regime_streak,
+            "last_entry_date": last_entry_date,
+            "days_since_last_entry": days_since_last_entry,
+            "days_near_breakout_30d": days_near_breakout_30d,
+            "_hist": hist[["day", "dist_pct"]].dropna(),
+        })
+
+    return pd.DataFrame(results)
+
+
+def render_signal_diagnosis(diag_df: pd.DataFrame, signals_df: pd.DataFrame):
+    """Renderiza la sección de diagnóstico de señales."""
+
+    st.subheader("🔍 Diagnóstico de señales — ¿Por qué no opera?")
+    st.caption(
+        "Muestra el estado actual de cada símbolo respecto a las condiciones de entrada: "
+        "régimen (SMA50>SMA200) y breakout Donchian."
+    )
+
+    if diag_df.empty:
+        st.info("Sin datos de señales disponibles.")
+        return
+
+    for _, row in diag_df.iterrows():
+        sym = row["symbol"]
+        regime_on = row["regime_on"]
+        entry_signal = row["entry_signal"]
+        dist_breakout = row["dist_to_breakout_pct"]
+        dist_sma200 = row["dist_to_sma200_pct"]
+        regime_streak = row["regime_streak_days"]
+        days_since_entry = row["days_since_last_entry"]
+        last_entry = row["last_entry_date"]
+        days_near = row["days_near_breakout_30d"]
+        hist = row["_hist"]
+
+        # Header del símbolo
+        if entry_signal:
+            status_icon = "🟢"
+            status_text = "SEÑAL DE ENTRADA ACTIVA"
+        elif regime_on:
+            status_icon = "🟡"
+            status_text = "Régimen ON — esperando breakout"
+        else:
+            status_icon = "🔴"
+            status_text = "Régimen OFF — bot inactivo"
+
+        with st.expander(f"{status_icon} **{sym}** — {status_text}", expanded=True):
+            col1, col2, col3, col4 = st.columns(4)
+
+            # Régimen
+            with col1:
+                regime_color = "normal" if regime_on else "off"
+                st.metric(
+                    "Régimen (SMA50>SMA200)",
+                    "✅ ON" if regime_on else "❌ OFF",
+                    f"{dist_sma200:+.1f}% vs SMA200" if dist_sma200 is not None else "N/A",
+                    delta_color="normal" if (dist_sma200 or 0) >= 0 else "inverse",
+                )
+
+            # Distancia al breakout
+            with col2:
+                if dist_breakout is not None:
+                    if dist_breakout >= 0:
+                        bk_label = f"✅ +{dist_breakout:.2f}% (roto)"
+                        bk_delta_color = "normal"
+                    elif dist_breakout >= -2:
+                        bk_label = f"⚡ {dist_breakout:.2f}% (muy cerca)"
+                        bk_delta_color = "normal"
+                    elif dist_breakout >= -5:
+                        bk_label = f"🟡 {dist_breakout:.2f}% (cerca)"
+                        bk_delta_color = "off"
+                    else:
+                        bk_label = f"🔴 {dist_breakout:.2f}% (lejos)"
+                        bk_delta_color = "inverse"
+                    st.metric(
+                        "Distancia al Donchian High",
+                        bk_label,
+                        f"Necesita subir {abs(dist_breakout):.2f}%" if dist_breakout < 0 else "¡Breakout!",
+                        delta_color=bk_delta_color,
+                    )
+                else:
+                    st.metric("Distancia al Donchian High", "N/A")
+
+            # Racha de régimen
+            with col3:
+                if regime_on:
+                    st.metric(
+                        "Días con régimen ON",
+                        f"{regime_streak} días",
+                        "Sin señal de entrada aún" if not entry_signal else "¡Señal activa!",
+                        delta_color="off" if not entry_signal else "normal",
+                    )
+                else:
+                    st.metric(
+                        "Días con régimen OFF",
+                        f"{regime_streak} días",
+                        "Bot inactivo este período",
+                        delta_color="inverse",
+                    )
+
+            # Última entrada
+            with col4:
+                if days_since_entry is not None:
+                    st.metric(
+                        "Última señal de entrada",
+                        f"Hace {days_since_entry} días",
+                        str(last_entry.date()) if last_entry is not None else "N/A",
+                        delta_color="off",
+                    )
+                else:
+                    st.metric("Última señal de entrada", "Nunca (ventana)", "Sin señales en el período")
+
+            # Barra de progreso visual hacia el breakout
+            if dist_breakout is not None and dist_breakout < 0:
+                progress_val = max(0.0, min(1.0, 1.0 - abs(dist_breakout) / 20.0))  # escala: 20% = 0%, 0% = 100%
+                st.markdown("**Proximidad al breakout** (escala: 0% = 20% lejos, 100% = en el nivel)")
+                st.progress(progress_val, text=f"{dist_breakout:.2f}% del Donchian High (20p)")
+
+            # Info adicional
+            info_parts = []
+            if days_near > 0:
+                info_parts.append(f"⚡ Estuvo cerca del breakout (≤2%) durante **{days_near} días** en los últimos 30")
+            if not regime_on and dist_sma200 is not None:
+                info_parts.append(
+                    f"Para activar el régimen, el precio necesita subir **{abs(dist_sma200):.1f}%** hasta la SMA200"
+                    if dist_sma200 < 0
+                    else f"El precio está **{dist_sma200:.1f}%** sobre la SMA200 — régimen casi activo"
+                )
+            if info_parts:
+                st.info("  \n".join(info_parts))
+
+            # Gráfico histórico de distancia al Donchian High
+            if not hist.empty and len(hist) > 3:
+                st.markdown("**Histórico distancia al Donchian High (últimos 60 días)**")
+                fig = go.Figure()
+
+                # Zona de "breakout" (>= 0%)
+                fig.add_hrect(y0=0, y1=hist["dist_pct"].max() + 1, fillcolor="rgba(0,200,100,0.08)", line_width=0)
+                # Zona "muy cerca" (-2% a 0%)
+                fig.add_hrect(y0=-2, y1=0, fillcolor="rgba(255,200,0,0.10)", line_width=0)
+
+                fig.add_trace(go.Scatter(
+                    x=hist["day"],
+                    y=hist["dist_pct"],
+                    mode="lines+markers",
+                    line=dict(color="#4A9EFF", width=2),
+                    marker=dict(size=4),
+                    name="Dist. %",
+                ))
+                fig.add_hline(y=0, line_dash="dash", line_color="rgba(0,200,100,0.7)", line_width=1.5,
+                              annotation_text="Breakout", annotation_position="top right")
+                fig.add_hline(y=-2, line_dash="dot", line_color="rgba(255,200,0,0.7)", line_width=1,
+                              annotation_text="Zona cerca (2%)", annotation_position="bottom right")
+
+                fig.update_layout(
+                    height=220,
+                    margin=dict(l=10, r=10, t=20, b=10),
+                    yaxis_title="% vs Donchian High",
+                    xaxis_title=None,
+                    showlegend=False,
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+    # Tabla resumen comparativa
+    st.markdown("#### Tabla resumen")
+    summary_cols = ["symbol", "regime_on", "dist_to_breakout_pct", "dist_to_sma200_pct",
+                    "regime_streak_days", "days_near_breakout_30d", "days_since_last_entry"]
+    summary_df = diag_df[summary_cols].copy()
+    summary_df.columns = [
+        "Símbolo", "Régimen ON", "Dist. Breakout %", "Dist. SMA200 %",
+        "Racha régimen (días)", "Días cerca breakout (30d)", "Días desde última entrada"
+    ]
+    for col in ["Dist. Breakout %", "Dist. SMA200 %"]:
+        summary_df[col] = summary_df[col].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else "N/A")
+
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    # Diagnóstico global
+    st.markdown("#### 🧠 Diagnóstico automático")
+    for _, row in diag_df.iterrows():
+        sym = row["symbol"]
+        regime_on = row["regime_on"]
+        dist_breakout = row["dist_to_breakout_pct"]
+        dist_sma200 = row["dist_to_sma200_pct"]
+
+        if row["entry_signal"]:
+            st.success(f"**{sym}**: Señal de entrada activa hoy. Si el bot no ha operado, revisa `trading_enabled` en settings.")
+        elif not regime_on:
+            if dist_sma200 is not None and dist_sma200 > -5:
+                st.warning(
+                    f"**{sym}**: Régimen OFF pero el precio está muy cerca de la SMA200 ({dist_sma200:+.1f}%). "
+                    f"Podría activarse pronto. El bot no opera porque SMA50 < SMA200."
+                )
+            else:
+                st.error(
+                    f"**{sym}**: Régimen OFF ({dist_sma200:+.1f}% vs SMA200). "
+                    f"El bot está inactivo porque el mercado está en tendencia bajista según SMA50/200."
+                )
+        elif dist_breakout is not None and dist_breakout < -10:
+            st.warning(
+                f"**{sym}**: Régimen ON pero el precio está **{abs(dist_breakout):.1f}%** lejos del Donchian High. "
+                f"No hay breakout. Puede ser mercado lateral o bajada reciente."
+            )
+        elif dist_breakout is not None and dist_breakout < 0:
+            st.info(
+                f"**{sym}**: Régimen ON y precio a solo **{abs(dist_breakout):.1f}%** del breakout Donchian. "
+                f"Cerca pero aún no suficiente."
+            )
 
 
 # -----------------------
@@ -246,7 +543,7 @@ show_eur = st.sidebar.toggle("Mostrar EUR aproximado", value=True)
 st.sidebar.subheader("Costes (estimación)")
 fee_bps = st.sidebar.number_input("Fee total por lado (bps)", min_value=0.0, max_value=50.0, value=10.0, step=1.0)
 slippage_bps = st.sidebar.number_input("Slippage por lado (bps)", min_value=0.0, max_value=100.0, value=5.0, step=1.0)
-st.sidebar.caption("Ejemplo: 10 bps = 0.10% por lado. En cripto spot suele ser bajo, pero mejor ser conservador.")
+st.sidebar.caption("Ejemplo: 10 bps = 0.10% por lado.")
 
 st.sidebar.divider()
 auto_refresh = st.sidebar.toggle("Auto-refresh (cada 30s)", value=True)
@@ -286,6 +583,16 @@ positions = read_df(
     """
 )
 
+# Para diagnóstico necesitamos más historial (90 días)
+signals_diag = read_df(
+    """
+    SELECT day, symbol, regime_on, entry_signal, exit_signal, close, sma200, donchian_high20, donchian_low10, atr14
+    FROM signals
+    WHERE day >= CURRENT_DATE - 90
+    ORDER BY day ASC, symbol
+    """,
+)
+
 signals = read_df(
     """
     SELECT day, symbol, regime_on, entry_signal, exit_signal, close, sma200, donchian_high20, donchian_low10, atr14
@@ -313,6 +620,7 @@ if not equity.empty:
 
 # Filter by symbols
 signals = signals[signals["symbol"].isin(symbols_sel)]
+signals_diag_filtered = signals_diag[signals_diag["symbol"].isin(symbols_sel)] if symbols_sel else signals_diag
 trades = trades[trades["symbol"].isin(symbols_sel)] if len(symbols_sel) else trades
 positions_f = positions[positions["symbol"].isin(symbols_sel)] if len(symbols_sel) else positions
 
@@ -357,7 +665,7 @@ p1, p2, p3, p4, p5 = st.columns(5)
 p1.metric("Net PnL (estim.)", f"{summary['net']:,.2f} USDC")
 p2.metric("Gross PnL", f"{summary['gross']:,.2f} USDC")
 p3.metric("Profit Factor", "∞" if summary["profit_factor"] == float("inf") else f"{summary['profit_factor']:,.2f}")
-p4.metric("Expectancy / trade", f"{summary['expectancy']:,.3f} USDC", help="E[PNL] por round-trip, neto (fees+slippage estimados)")
+p4.metric("Expectancy / trade", f"{summary['expectancy']:,.3f} USDC")
 p5.metric("Holding medio", f"{summary['avg_hold_h']:,.1f} h")
 
 st.divider()
@@ -395,6 +703,14 @@ with b:
         fig = px.area(dd_df, x="day", y="drawdown", labels={"drawdown": "drawdown", "day": "día"})
         fig.update_layout(height=340, margin=dict(l=10, r=10, t=40, b=10))
         st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+# -----------------------
+# *** DIAGNÓSTICO DE SEÑALES (NUEVO) ***
+# -----------------------
+diag_df = compute_signal_diagnosis(signals_diag_filtered)
+render_signal_diagnosis(diag_df, signals_diag_filtered)
 
 st.divider()
 
@@ -466,7 +782,6 @@ with t1:
     if trades.empty:
         st.info("Sin trades en la ventana.")
     else:
-        # mostrar desc por lectura humana
         st.dataframe(trades.sort_values("created_at", ascending=False), use_container_width=True, hide_index=True)
 
 with t2:
