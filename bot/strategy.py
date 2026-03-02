@@ -5,6 +5,10 @@ STRATEGY (V3)
 - Regime: SMA50 > SMA200
 - Entry: close > DonchianHigh(entry) and regime_on
 - Exit:  close < DonchianLow(exit) or regime_off
+
+FIX Bug 1: decide() devuelve donchian_high y donchian_low con los períodos
+REALES configurados (no hardcoded 20/10), para que main.py los guarde en
+la BD y el dashboard los muestre correctamente.
 """
 
 import os
@@ -53,10 +57,11 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["sma50"] = sma(df["close"], 50)
     df["sma200"] = sma(df["close"], 200)
 
+    # Donchian con períodos reales configurados — los que usa el bot para operar
     df["donchian_high"] = df["high"].shift(1).rolling(donch_entry).max()
     df["donchian_low"] = df["low"].shift(1).rolling(donch_exit).min()
 
-    # Legacy (para no romper tu tabla signals actual)
+    # Legacy: mantener compatibilidad con filas antiguas de la BD
     df["donchian_high20"] = df["high"].shift(1).rolling(20).max()
     df["donchian_low10"] = df["low"].shift(1).rolling(10).min()
 
@@ -64,30 +69,40 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def decide(df: pd.DataFrame, symbol: str | None = None):
+def decide(df: pd.DataFrame, symbol: str | None = None) -> dict:
     row = df.iloc[-1]
 
     close = float(row["close"]) if pd.notna(row["close"]) else None
     sma50_v = float(row["sma50"]) if pd.notna(row["sma50"]) else None
     sma200_v = float(row["sma200"]) if pd.notna(row["sma200"]) else None
 
+    # Valores REALES con los que opera el bot
     highN = float(row["donchian_high"]) if pd.notna(row["donchian_high"]) else None
     lowM = float(row["donchian_low"]) if pd.notna(row["donchian_low"]) else None
 
+    # Legacy para insertar en columnas existentes de la BD
     high20 = float(row["donchian_high20"]) if pd.notna(row["donchian_high20"]) else None
     low10 = float(row["donchian_low10"]) if pd.notna(row["donchian_low10"]) else None
 
     atr14_v = float(row["atr14"]) if pd.notna(row["atr14"]) else None
+
+    donch_entry = _env_int("DONCH_ENTRY", 55)
+    donch_exit = _env_int("DONCH_EXIT", 20)
 
     if sma50_v is None or sma200_v is None:
         regime_on = False
     else:
         regime_on = sma50_v > sma200_v
 
-    entry_signal = bool(regime_on and (highN is not None) and (close is not None) and (close > highN))
-    exit_signal = bool(((lowM is not None) and (close is not None) and (close < lowM)) or (not regime_on))
+    # Señales basadas en el Donchian REAL (no el legacy de 20p)
+    entry_signal = bool(
+        regime_on and (highN is not None) and (close is not None) and (close > highN)
+    )
+    exit_signal = bool(
+        ((lowM is not None) and (close is not None) and (close < lowM)) or (not regime_on)
+    )
 
-    # TEST MODE (igual que antes)
+    # TEST MODE
     test_mode = _env_flag("TEST_MODE", "false")
     if test_mode:
         force_regime = _env_flag("TEST_FORCE_REGIME_ON", "false")
@@ -99,15 +114,12 @@ def decide(df: pd.DataFrame, symbol: str | None = None):
             regime_on = True
         if not regime_on:
             entry_signal = False
-
         if symbol and force_exit_sym and symbol == force_exit_sym:
             exit_signal = True
-
         if symbol and force_entry_sym and symbol == force_entry_sym:
             if ignore_exit:
                 exit_signal = False
             entry_signal = True
-
         if exit_signal:
             entry_signal = False
 
@@ -120,14 +132,15 @@ def decide(df: pd.DataFrame, symbol: str | None = None):
         "sma50": sma50_v,
         "sma200": sma200_v,
 
+        # Valores reales del Donchian configurado
         "donchian_high": highN,
         "donchian_low": lowM,
+        "donch_entry": donch_entry,
+        "donch_exit": donch_exit,
 
-        # legacy for DB insert
+        # Legacy para compatibilidad con INSERT en BD
         "donchian_high20": high20,
         "donchian_low10": low10,
 
         "atr14": atr14_v,
-        "donch_entry": _env_int("DONCH_ENTRY", 55),
-        "donch_exit": _env_int("DONCH_EXIT", 20),
     }

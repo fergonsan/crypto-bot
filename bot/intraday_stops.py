@@ -1,13 +1,16 @@
 """
 INTRADAY STOPS (V3) - stop_on_low
 =================================
-Ejecuta cada X minutos y solo dispara stops:
-- stop_level = max(hard_stop, trail_stop)
-- obtiene última vela intradía (default 5m)
-- si low <= stop_level -> market sell
+Ejecuta cada X minutos y:
+1. Actualiza peak_close y trail_stop con el high de la vela intradía
+2. Si low <= stop_level -> market sell
 
 Lock:
 - Usa advisory lock "bot_intraday_stops".
+
+FIX Bug 3: Ahora actualiza peak_close y trail_stop con el high de la vela
+intradía, para que el trailing stop no quede congelado hasta el cierre diario.
+Si el precio hace un nuevo máximo intradía, el trail sube proporcionalmente.
 """
 
 import os
@@ -28,7 +31,7 @@ STOP_CHECK_LIMIT = int(os.environ.get("STOP_CHECK_LIMIT", "2"))
 ALLOWLIST = set(SYMBOLS)
 
 
-def fetch_last_intraday_candle(ex, symbol: str):
+def fetch_last_intraday_candle(ex, symbol: str) -> dict | None:
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=STOP_CHECK_TIMEFRAME, limit=STOP_CHECK_LIMIT)
     if not ohlcv:
         return None
@@ -50,20 +53,34 @@ def get_open_positions(conn) -> list[dict]:
             "FROM positions WHERE qty > 0"
         )
         rows = cur.fetchall() or []
-        out = []
-        for r in rows:
-            out.append(
-                {
-                    "symbol": r[0],
-                    "qty": float(r[1] or 0.0),
-                    "entry_price": float(r[2] or 0.0),
-                    "entry_time": r[3],
-                    "peak_close": float(r[4] or 0.0),
-                    "hard_stop": float(r[5] or 0.0),
-                    "trail_stop": float(r[6] or 0.0),
-                }
-            )
-        return out
+        return [
+            {
+                "symbol": r[0],
+                "qty": float(r[1] or 0.0),
+                "entry_price": float(r[2] or 0.0),
+                "entry_time": r[3],
+                "peak_close": float(r[4] or 0.0),
+                "hard_stop": float(r[5] or 0.0),
+                "trail_stop": float(r[6] or 0.0),
+            }
+            for r in rows
+        ]
+
+
+def update_position_trail(conn, symbol: str, peak_close: float, trail_stop: float):
+    """
+    Bug 3 fix: actualiza solo peak_close y trail_stop (no toca qty ni entry_price).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE positions
+               SET peak_close=%s, trail_stop=%s, updated_at=NOW()
+             WHERE symbol=%s
+            """,
+            (peak_close, trail_stop, symbol),
+        )
+    conn.commit()
 
 
 def close_position(conn, symbol: str):
@@ -103,26 +120,52 @@ def main():
             set_run_status(conn, run_id, "ok", "no_positions")
             return
 
-        msgs = []
-        msgs.append(f"🛡️ INTRADAY stops | tf={STOP_CHECK_TIMEFRAME} | DRY_RUN={DRY_RUN} | positions={len(positions)}")
+        msgs = [
+            f"🛡️ INTRADAY stops | tf={STOP_CHECK_TIMEFRAME} | "
+            f"DRY_RUN={DRY_RUN} | positions={len(positions)}"
+        ]
 
         for p in positions:
             sym = p["symbol"]
             qty = float(p["qty"])
-            stop_level = max(float(p["hard_stop"] or 0.0), float(p["trail_stop"] or 0.0))
-            if qty <= 0 or stop_level <= 0:
+            hard_stop = float(p["hard_stop"] or 0.0)
+            trail_stop = float(p["trail_stop"] or 0.0)
+            peak_close = float(p["peak_close"] or 0.0)
+
+            if qty <= 0:
                 continue
 
             candle = fetch_last_intraday_candle(ex, sym)
             if candle is None:
                 ticker = ex.fetch_ticker(sym)
                 last = float(ticker.get("last") or 0.0)
+                high = last
                 low = last
                 cts = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
             else:
+                high = float(candle["high"])
                 low = float(candle["low"])
                 last = float(candle["close"])
                 cts = candle["ts"]
+
+            # Bug 3 fix: si hay nuevo máximo intradía, subir peak y trail proporcionalmente
+            if high > peak_close and high > 0:
+                delta = high - peak_close          # cuánto subió el pico
+                new_peak = high
+                new_trail = trail_stop + delta      # trail sube la misma cantidad
+                update_position_trail(conn, sym, new_peak, new_trail)
+                msgs.append(
+                    f"📈 {sym}: nuevo peak intradía {peak_close:.4f}→{new_peak:.4f} "
+                    f"trail {trail_stop:.4f}→{new_trail:.4f}"
+                )
+                peak_close = new_peak
+                trail_stop = new_trail
+
+            stop_level = max(hard_stop, trail_stop)
+
+            if stop_level <= 0:
+                msgs.append(f"⚠️ {sym}: stop_level=0, posición sin stop configurado.")
+                continue
 
             if low <= stop_level:
                 executed = (not DRY_RUN)
@@ -136,19 +179,22 @@ def main():
 
                 with conn.cursor() as cur:
                     cur.execute(
-                        "INSERT INTO trades(symbol,side,qty,price,notional,reason) VALUES(%s,'sell',%s,%s,%s,%s)",
+                        "INSERT INTO trades(symbol,side,qty,price,notional,reason) "
+                        "VALUES(%s,'sell',%s,%s,%s,%s)",
                         (sym, qty, price, notional, "stop_intraday_low"),
                     )
                 conn.commit()
 
                 close_position(conn, sym)
-
                 msgs.append(
-                    f"🛑 STOP {sym} qty={qty:.8f} px~{price:.4f} notional~{notional:.2f} "
-                    f"low~{low:.4f} stop~{stop_level:.4f} ts={cts} ({'LIVE' if executed else 'PAPER'})"
+                    f"🛑 STOP {sym} qty={qty:.8f} px~{price:.4f} "
+                    f"notional~{notional:.2f} low~{low:.4f} stop~{stop_level:.4f} "
+                    f"ts={cts} ({'LIVE' if executed else 'PAPER'})"
                 )
             else:
-                msgs.append(f"• {sym}: ok low~{low:.4f} stop~{stop_level:.4f} last~{last:.4f}")
+                msgs.append(
+                    f"• {sym}: ok low~{low:.4f} stop~{stop_level:.4f} last~{last:.4f}"
+                )
 
         telegram_send("\n".join(msgs))
         set_run_status(conn, run_id, "ok", "completed_intraday")

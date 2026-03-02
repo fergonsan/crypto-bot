@@ -8,6 +8,13 @@ DAILY BOT (V3)
 
 Lock:
 - Usa advisory lock "bot_daily" para evitar concurrente.
+
+FIXES:
+- Bug 1: Guarda donchian_high_real / donchian_low_real en signals (valores
+         reales configurados, no el legacy de 20/10 períodos).
+         Las columnas nuevas se añaden automáticamente si no existen (ALTER TABLE).
+- Bug 2: El trail stop solo se actualiza si close y atr14 son válidos (no nulos).
+         Si faltan datos ese ciclo, se avisa por Telegram pero NO se toca el stop.
 """
 
 import os
@@ -64,7 +71,8 @@ def get_bot_position(conn, symbol: str) -> dict | None:
 
 
 def upsert_bot_position(conn, symbol: str, qty: float, entry_price: float | None,
-                        entry_time=None, peak_close: float = 0.0, hard_stop: float = 0.0, trail_stop: float = 0.0):
+                        entry_time=None, peak_close: float = 0.0,
+                        hard_stop: float = 0.0, trail_stop: float = 0.0):
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -93,10 +101,8 @@ def orders_today_count(conn, day: dt.date) -> int:
 def get_bot_equity_usdc(conn, ex, symbols: list[str]) -> float:
     bal = ex.fetch_balance()
     usdc_total = float(bal["total"].get("USDC", 0.0) or 0.0)
-
     tickers = ex.fetch_tickers(symbols)
     equity = usdc_total
-
     for sym in symbols:
         last = tickers.get(sym, {}).get("last")
         if not last:
@@ -104,8 +110,24 @@ def get_bot_equity_usdc(conn, ex, symbols: list[str]) -> float:
         pos = get_bot_position(conn, sym)
         qty = float(pos["qty"]) if pos else 0.0
         equity += qty * float(last)
-
     return float(equity)
+
+
+def ensure_signals_columns(conn):
+    """
+    Bug 1 fix: añade columnas nuevas a signals si no existen.
+    Permite deploy incremental sin modificar schema.sql manualmente.
+    """
+    new_cols = [
+        ("donchian_high_real", "NUMERIC"),
+        ("donchian_low_real",  "NUMERIC"),
+        ("donch_entry_n",      "INTEGER"),
+        ("donch_exit_n",       "INTEGER"),
+    ]
+    with conn.cursor() as cur:
+        for col, dtype in new_cols:
+            cur.execute(f"ALTER TABLE signals ADD COLUMN IF NOT EXISTS {col} {dtype}")
+    conn.commit()
 
 
 def main():
@@ -117,6 +139,9 @@ def main():
         if not try_advisory_lock(conn, lock_key):
             set_run_status(conn, run_id, "ok", "lock_not_acquired")
             return
+
+        # Bug 1 fix: asegurar columnas nuevas antes de cualquier INSERT
+        ensure_signals_columns(conn)
 
         trading_enabled = get_setting(conn, "trading_enabled", "false").lower() == "true"
         max_order_notional = float(get_setting(conn, "max_order_notional_usdc", "300"))
@@ -141,7 +166,10 @@ def main():
             )
         conn.commit()
 
-        mode_str = ("LIVE" if (trading_enabled and not DRY_RUN) else ("PAPER" if trading_enabled else "DISABLED"))
+        mode_str = (
+            "LIVE" if (trading_enabled and not DRY_RUN)
+            else ("PAPER" if trading_enabled else "DISABLED")
+        )
         msgs = [
             f"🧠 DAILY {today} | equity~{bot_equity:.2f} USDC | {mode_str} | DRY_RUN={DRY_RUN}",
             f"⚙️ V3: Donch={os.environ.get('DONCH_ENTRY')}/{os.environ.get('DONCH_EXIT')} "
@@ -156,23 +184,41 @@ def main():
             d = decide(df, symbol)
             daily_signals[symbol] = d
 
-            # legacy insert
+            # Bug 1 fix: guardar también los valores reales del Donchian configurado
             with conn.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO signals(day,symbol,regime_on,entry_signal,exit_signal,close,sma200,donchian_high20,donchian_low10,atr14)
-                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                       ON CONFLICT(day,symbol) DO UPDATE SET
-                         regime_on=EXCLUDED.regime_on,
-                         entry_signal=EXCLUDED.entry_signal,
-                         exit_signal=EXCLUDED.exit_signal,
-                         close=EXCLUDED.close,
-                         sma200=EXCLUDED.sma200,
-                         donchian_high20=EXCLUDED.donchian_high20,
-                         donchian_low10=EXCLUDED.donchian_low10,
-                         atr14=EXCLUDED.atr14
+                    """
+                    INSERT INTO signals(
+                        day, symbol, regime_on, entry_signal, exit_signal,
+                        close, sma200,
+                        donchian_high20, donchian_low10,
+                        donchian_high_real, donchian_low_real,
+                        donch_entry_n, donch_exit_n,
+                        atr14
+                    )
+                    VALUES(%s,%s,%s,%s,%s, %s,%s, %s,%s, %s,%s, %s,%s, %s)
+                    ON CONFLICT(day,symbol) DO UPDATE SET
+                        regime_on=EXCLUDED.regime_on,
+                        entry_signal=EXCLUDED.entry_signal,
+                        exit_signal=EXCLUDED.exit_signal,
+                        close=EXCLUDED.close,
+                        sma200=EXCLUDED.sma200,
+                        donchian_high20=EXCLUDED.donchian_high20,
+                        donchian_low10=EXCLUDED.donchian_low10,
+                        donchian_high_real=EXCLUDED.donchian_high_real,
+                        donchian_low_real=EXCLUDED.donchian_low_real,
+                        donch_entry_n=EXCLUDED.donch_entry_n,
+                        donch_exit_n=EXCLUDED.donch_exit_n,
+                        atr14=EXCLUDED.atr14
                     """,
-                    (today, symbol, d["regime_on"], d["entry_signal"], d["exit_signal"], d["close"],
-                     d["sma200"], d["donchian_high20"], d["donchian_low10"], d["atr14"]),
+                    (
+                        today, symbol, d["regime_on"], d["entry_signal"], d["exit_signal"],
+                        d["close"], d["sma200"],
+                        d["donchian_high20"], d["donchian_low10"],
+                        d["donchian_high"], d["donchian_low"],
+                        d["donch_entry"], d["donch_exit"],
+                        d["atr14"],
+                    ),
                 )
             conn.commit()
 
@@ -198,41 +244,58 @@ def main():
             pos = get_bot_position(conn, symbol)
             bot_qty = float(pos["qty"]) if pos else 0.0
 
-            # Update stops + close-based stop fallback
-            if bot_qty > 0 and close and atr14:
-                peak_close = max(float(pos.get("peak_close") or 0.0), float(close))
-                trail_candidate = peak_close - (TRAIL_ATR_MULT * float(atr14))
-                trail_stop = max(float(pos.get("trail_stop") or 0.0), float(trail_candidate))
+            # Actualizar stops + fallback stop por close diario
+            if bot_qty > 0:
+                # Bug 2 fix: solo actualizar trail si tenemos datos válidos
+                if close is not None and atr14 is not None and float(close) > 0 and float(atr14) > 0:
+                    peak_close = max(float(pos.get("peak_close") or 0.0), float(close))
+                    trail_candidate = peak_close - (TRAIL_ATR_MULT * float(atr14))
+                    trail_stop = max(float(pos.get("trail_stop") or 0.0), float(trail_candidate))
 
-                hard_stop = float(pos.get("hard_stop") or 0.0)
-                if hard_stop <= 0.0:
-                    hard_stop = float(pos["entry_price"]) - (HARD_STOP_ATR_MULT * float(atr14))
+                    hard_stop = float(pos.get("hard_stop") or 0.0)
+                    if hard_stop <= 0.0:
+                        hard_stop = float(pos["entry_price"]) - (HARD_STOP_ATR_MULT * float(atr14))
 
-                stop_level = max(hard_stop, trail_stop)
+                    stop_level = max(hard_stop, trail_stop)
 
-                upsert_bot_position(conn, symbol, bot_qty, float(pos["entry_price"]),
-                                    entry_time=pos.get("entry_time"), peak_close=peak_close,
-                                    hard_stop=hard_stop, trail_stop=trail_stop)
+                    upsert_bot_position(
+                        conn, symbol, bot_qty, float(pos["entry_price"]),
+                        entry_time=pos.get("entry_time"), peak_close=peak_close,
+                        hard_stop=hard_stop, trail_stop=trail_stop,
+                    )
 
-                if float(close) < stop_level:
-                    executed = (not DRY_RUN)
-                    if executed:
-                        order = ex.create_market_sell_order(symbol, bot_qty)
-                        price = float(order.get("average") or close or 0.0)
-                    else:
-                        price = float(close)
+                    if float(close) < stop_level:
+                        executed = (not DRY_RUN)
+                        if executed:
+                            order = ex.create_market_sell_order(symbol, bot_qty)
+                            price = float(order.get("average") or close or 0.0)
+                        else:
+                            price = float(close)
 
-                    notional = bot_qty * price
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "INSERT INTO trades(symbol,side,qty,price,notional,reason) VALUES(%s,'sell',%s,%s,%s,%s)",
-                            (symbol, bot_qty, price, notional, "stop_close_daily"),
+                        notional = bot_qty * price
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "INSERT INTO trades(symbol,side,qty,price,notional,reason) "
+                                "VALUES(%s,'sell',%s,%s,%s,%s)",
+                                (symbol, bot_qty, price, notional, "stop_close_daily"),
+                            )
+                        conn.commit()
+
+                        upsert_bot_position(conn, symbol, 0.0, None, entry_time=None,
+                                            peak_close=0.0, hard_stop=0.0, trail_stop=0.0)
+                        msgs.append(
+                            f"🛑 STOP(daily close) {symbol} qty={bot_qty:.8f} "
+                            f"px~{price:.4f} stop~{stop_level:.4f} "
+                            f"({'LIVE' if executed else 'PAPER'})"
                         )
-                    conn.commit()
+                        continue
 
-                    upsert_bot_position(conn, symbol, 0.0, None, entry_time=None, peak_close=0.0, hard_stop=0.0, trail_stop=0.0)
-                    msgs.append(f"🛑 STOP(daily close) {symbol} qty={bot_qty:.8f} px~{price:.4f} stop~{stop_level:.4f} ({'LIVE' if executed else 'PAPER'})")
-                    continue
+                else:
+                    # Bug 2 fix: datos nulos → no tocar stops, avisar
+                    msgs.append(
+                        f"⚠️ {symbol}: posición abierta pero close/atr14 nulos — "
+                        f"stops NO actualizados este ciclo."
+                    )
 
             # Exit por señal
             if bot_qty > 0 and d["exit_signal"]:
@@ -246,13 +309,18 @@ def main():
                 notional = bot_qty * price
                 with conn.cursor() as cur:
                     cur.execute(
-                        "INSERT INTO trades(symbol,side,qty,price,notional,reason) VALUES(%s,'sell',%s,%s,%s,%s)",
+                        "INSERT INTO trades(symbol,side,qty,price,notional,reason) "
+                        "VALUES(%s,'sell',%s,%s,%s,%s)",
                         (symbol, bot_qty, price, notional, "exit_signal_or_regime_off"),
                     )
                 conn.commit()
 
-                upsert_bot_position(conn, symbol, 0.0, None, entry_time=None, peak_close=0.0, hard_stop=0.0, trail_stop=0.0)
-                msgs.append(f"🔻 SELL {symbol} qty={bot_qty:.8f} px~{price:.4f} ({'LIVE' if executed else 'PAPER'})")
+                upsert_bot_position(conn, symbol, 0.0, None, entry_time=None,
+                                    peak_close=0.0, hard_stop=0.0, trail_stop=0.0)
+                msgs.append(
+                    f"🔻 SELL {symbol} qty={bot_qty:.8f} px~{price:.4f} "
+                    f"({'LIVE' if executed else 'PAPER'})"
+                )
                 continue
 
             # Entry
@@ -261,8 +329,10 @@ def main():
                     msgs.append(f"⚪ {symbol}: entry pero sin ATR/close.")
                     continue
 
-                qty = position_size_usdc(bot_equity, RISK_PER_TRADE, float(atr14), float(close), hard_stop_atr_mult=HARD_STOP_ATR_MULT)
-
+                qty = position_size_usdc(
+                    bot_equity, RISK_PER_TRADE, float(atr14), float(close),
+                    hard_stop_atr_mult=HARD_STOP_ATR_MULT,
+                )
                 qty = min(qty, max_order_notional / float(close))
                 qty = min(qty, (bot_equity * max_asset_exposure_pct) / float(close))
                 qty = min(qty, (quote_free / float(close)) if float(close) > 0 else 0.0)
@@ -279,7 +349,6 @@ def main():
                     price = float(close)
 
                 notional = qty * price
-
                 entry_time = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
                 hard_stop = float(price) - (HARD_STOP_ATR_MULT * float(atr14))
                 peak_close = float(price)
@@ -287,16 +356,22 @@ def main():
 
                 with conn.cursor() as cur:
                     cur.execute(
-                        "INSERT INTO trades(symbol,side,qty,price,notional,reason) VALUES(%s,'buy',%s,%s,%s,%s)",
+                        "INSERT INTO trades(symbol,side,qty,price,notional,reason) "
+                        "VALUES(%s,'buy',%s,%s,%s,%s)",
                         (symbol, qty, price, notional, "donchian_breakout_regime_on"),
                     )
                 conn.commit()
 
-                upsert_bot_position(conn, symbol, float(qty), float(price), entry_time=entry_time,
-                                    peak_close=peak_close, hard_stop=hard_stop, trail_stop=trail_stop)
-
+                upsert_bot_position(
+                    conn, symbol, float(qty), float(price), entry_time=entry_time,
+                    peak_close=peak_close, hard_stop=hard_stop, trail_stop=trail_stop,
+                )
                 quote_free -= notional
-                msgs.append(f"🔺 BUY {symbol} qty={qty:.8f} px~{price:.4f} hard~{hard_stop:.4f} trail~{trail_stop:.4f} ({'LIVE' if executed else 'PAPER'})")
+                msgs.append(
+                    f"🔺 BUY {symbol} qty={qty:.8f} px~{price:.4f} "
+                    f"hard~{hard_stop:.4f} trail~{trail_stop:.4f} "
+                    f"({'LIVE' if executed else 'PAPER'})"
+                )
                 continue
 
         telegram_send("\n".join(msgs))
