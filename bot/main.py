@@ -42,6 +42,45 @@ TRAIL_ATR_MULT = float(os.environ.get("TRAIL_ATR_MULT", "3.0"))
 ALLOWLIST = set(SYMBOLS)
 
 
+def _symbol_prefix(symbol: str) -> str:
+    """Extrae el prefijo de variable de entorno del símbolo: 'BTC/USDC' → 'BTC'."""
+    return symbol.split("/")[0].upper()
+
+
+def _sym_float(prefix: str, name: str, global_val: float) -> float:
+    """Lee {PREFIX}_{NAME} de env; si no existe, devuelve global_val."""
+    v = os.environ.get(f"{prefix}_{name}")
+    if v is not None:
+        try:
+            return float(v)
+        except Exception:
+            pass
+    return global_val
+
+
+def _sym_int(prefix: str, name: str, global_val: int) -> int:
+    """Lee {PREFIX}_{NAME} de env; si no existe, devuelve global_val."""
+    v = os.environ.get(f"{prefix}_{name}")
+    if v is not None:
+        try:
+            return int(v)
+        except Exception:
+            pass
+    return global_val
+
+
+def _symbol_config(symbol: str) -> dict:
+    """Devuelve el dict de parámetros para el símbolo dado, con fallback a globales."""
+    prefix = _symbol_prefix(symbol)
+    return {
+        "donch_entry": _sym_int(prefix, "DONCH_ENTRY", int(os.environ.get("DONCH_ENTRY", "55"))),
+        "donch_exit": _sym_int(prefix, "DONCH_EXIT", int(os.environ.get("DONCH_EXIT", "20"))),
+        "risk_per_trade": _sym_float(prefix, "RISK_PER_TRADE", RISK_PER_TRADE),
+        "hard_stop_atr_mult": _sym_float(prefix, "HARD_STOP_ATR_MULT", HARD_STOP_ATR_MULT),
+        "trail_atr_mult": _sym_float(prefix, "TRAIL_ATR_MULT", TRAIL_ATR_MULT),
+    }
+
+
 def fetch_ohlcv_df(ex, symbol: str, limit: int = 500) -> pd.DataFrame:
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
@@ -178,10 +217,13 @@ def main():
 
         # Señales
         daily_signals = {}
+        symbol_configs = {}
         for symbol in SYMBOLS:
+            cfg = _symbol_config(symbol)
+            symbol_configs[symbol] = cfg
             df = fetch_ohlcv_df(ex, symbol, limit=500)
-            df = compute_indicators(df)
-            d = decide(df, symbol)
+            df = compute_indicators(df, donch_entry=cfg["donch_entry"], donch_exit=cfg["donch_exit"])
+            d = decide(df, symbol, donch_entry=cfg["donch_entry"], donch_exit=cfg["donch_exit"])
             daily_signals[symbol] = d
 
             # Bug 1 fix: guardar también los valores reales del Donchian configurado
@@ -238,6 +280,7 @@ def main():
 
         for symbol in SYMBOLS:
             d = daily_signals[symbol]
+            cfg = symbol_configs[symbol]
             close = d["close"]
             atr14 = d["atr14"]
 
@@ -249,12 +292,12 @@ def main():
                 # Bug 2 fix: solo actualizar trail si tenemos datos válidos
                 if close is not None and atr14 is not None and float(close) > 0 and float(atr14) > 0:
                     peak_close = max(float(pos.get("peak_close") or 0.0), float(close))
-                    trail_candidate = peak_close - (TRAIL_ATR_MULT * float(atr14))
+                    trail_candidate = peak_close - (cfg["trail_atr_mult"] * float(atr14))
                     trail_stop = max(float(pos.get("trail_stop") or 0.0), float(trail_candidate))
 
                     hard_stop = float(pos.get("hard_stop") or 0.0)
                     if hard_stop <= 0.0:
-                        hard_stop = float(pos["entry_price"]) - (HARD_STOP_ATR_MULT * float(atr14))
+                        hard_stop = float(pos["entry_price"]) - (cfg["hard_stop_atr_mult"] * float(atr14))
 
                     stop_level = max(hard_stop, trail_stop)
 
@@ -330,8 +373,8 @@ def main():
                     continue
 
                 qty = position_size_usdc(
-                    bot_equity, RISK_PER_TRADE, float(atr14), float(close),
-                    hard_stop_atr_mult=HARD_STOP_ATR_MULT,
+                    bot_equity, cfg["risk_per_trade"], float(atr14), float(close),
+                    hard_stop_atr_mult=cfg["hard_stop_atr_mult"],
                 )
                 qty = min(qty, max_order_notional / float(close))
                 qty = min(qty, (bot_equity * max_asset_exposure_pct) / float(close))
@@ -350,9 +393,9 @@ def main():
 
                 notional = qty * price
                 entry_time = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
-                hard_stop = float(price) - (HARD_STOP_ATR_MULT * float(atr14))
+                hard_stop = float(price) - (cfg["hard_stop_atr_mult"] * float(atr14))
                 peak_close = float(price)
-                trail_stop = peak_close - (TRAIL_ATR_MULT * float(atr14))
+                trail_stop = peak_close - (cfg["trail_atr_mult"] * float(atr14))
 
                 with conn.cursor() as cur:
                     cur.execute(

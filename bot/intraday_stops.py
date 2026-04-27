@@ -30,6 +30,20 @@ STOP_CHECK_LIMIT = int(os.environ.get("STOP_CHECK_LIMIT", "2"))
 
 ALLOWLIST = set(SYMBOLS)
 
+_GLOBAL_TRAIL_ATR_MULT = float(os.environ.get("TRAIL_ATR_MULT", "3.0"))
+
+
+def _get_trail_atr_mult(symbol: str) -> float:
+    """Lee {PREFIX}_TRAIL_ATR_MULT → TRAIL_ATR_MULT → 3.0."""
+    prefix = symbol.split("/")[0].upper()
+    v = os.environ.get(f"{prefix}_TRAIL_ATR_MULT")
+    if v is not None:
+        try:
+            return float(v)
+        except Exception:
+            pass
+    return _GLOBAL_TRAIL_ATR_MULT
+
 
 def fetch_last_intraday_candle(ex, symbol: str) -> dict | None:
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=STOP_CHECK_TIMEFRAME, limit=STOP_CHECK_LIMIT)

@@ -48,11 +48,15 @@ def _env_flag(name: str, default: str = "false") -> bool:
     return os.environ.get(name, default).lower() == "true"
 
 
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def compute_indicators(
+    df: pd.DataFrame,
+    donch_entry: int | None = None,
+    donch_exit: int | None = None,
+) -> pd.DataFrame:
     df = df.copy()
 
-    donch_entry = _env_int("DONCH_ENTRY", 55)
-    donch_exit = _env_int("DONCH_EXIT", 20)
+    donch_entry = donch_entry if donch_entry is not None else _env_int("DONCH_ENTRY", 55)
+    donch_exit = donch_exit if donch_exit is not None else _env_int("DONCH_EXIT", 20)
 
     df["sma50"] = sma(df["close"], 50)
     df["sma200"] = sma(df["close"], 200)
@@ -69,7 +73,12 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def decide(df: pd.DataFrame, symbol: str | None = None) -> dict:
+def decide(
+    df: pd.DataFrame,
+    symbol: str | None = None,
+    donch_entry: int | None = None,
+    donch_exit: int | None = None,
+) -> dict:
     row = df.iloc[-1]
 
     close = float(row["close"]) if pd.notna(row["close"]) else None
@@ -86,8 +95,8 @@ def decide(df: pd.DataFrame, symbol: str | None = None) -> dict:
 
     atr14_v = float(row["atr14"]) if pd.notna(row["atr14"]) else None
 
-    donch_entry = _env_int("DONCH_ENTRY", 55)
-    donch_exit = _env_int("DONCH_EXIT", 20)
+    donch_entry = donch_entry if donch_entry is not None else _env_int("DONCH_ENTRY", 55)
+    donch_exit = donch_exit if donch_exit is not None else _env_int("DONCH_EXIT", 20)
 
     if sma50_v is None or sma200_v is None:
         regime_on = False
