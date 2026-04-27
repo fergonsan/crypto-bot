@@ -211,8 +211,6 @@ def main():
         )
         msgs = [
             f"🧠 DAILY {today} | equity~{bot_equity:.2f} USDC | {mode_str} | DRY_RUN={DRY_RUN}",
-            f"⚙️ V3: Donch={os.environ.get('DONCH_ENTRY')}/{os.environ.get('DONCH_EXIT')} "
-            f"risk={RISK_PER_TRADE:.4f} hardATR={HARD_STOP_ATR_MULT:.2f} trailATR={TRAIL_ATR_MULT:.2f}",
         ]
 
         # Señales
@@ -263,6 +261,49 @@ def main():
                     ),
                 )
             conn.commit()
+
+        # Resumen de señales por símbolo
+        _global_donch_entry = int(os.environ.get("DONCH_ENTRY", "55"))
+        _global_donch_exit = int(os.environ.get("DONCH_EXIT", "20"))
+        for symbol in SYMBOLS:
+            d = daily_signals[symbol]
+            cfg = symbol_configs[symbol]
+            close_v = d["close"]
+            atr14_v = d["atr14"]
+            sma50_v = d["sma50"]
+            sma200_v = d["sma200"]
+
+            close_str = f"{close_v:.0f}" if close_v is not None else "N/A"
+            atr_str = f"{atr14_v:.0f}" if atr14_v is not None else "N/A"
+            if d["regime_on"]:
+                regime_str = "ON (SMA50>SMA200)"
+            else:
+                regime_str = "OFF (SMA50<SMA200)"
+            if sma50_v is not None and sma200_v is not None:
+                regime_str = regime_str.replace(
+                    "SMA50", f"{sma50_v:.0f}").replace("SMA200", f"{sma200_v:.0f}"
+                )
+            entry_str = "SÍ" if d["entry_signal"] else "NO"
+            exit_str = "SÍ" if d["exit_signal"] else "NO"
+            msgs.append(
+                f"📊 {symbol} | close={close_str} | regime={regime_str} | "
+                f"entry={entry_str} | exit={exit_str} | ATR14={atr_str}"
+            )
+
+            has_custom = (
+                cfg["donch_entry"] != _global_donch_entry
+                or cfg["donch_exit"] != _global_donch_exit
+                or cfg["risk_per_trade"] != RISK_PER_TRADE
+                or cfg["hard_stop_atr_mult"] != HARD_STOP_ATR_MULT
+                or cfg["trail_atr_mult"] != TRAIL_ATR_MULT
+            )
+            if has_custom:
+                base = symbol.split("/")[0]
+                msgs.append(
+                    f"  ↳ {base} config: Donch={cfg['donch_entry']}/{cfg['donch_exit']} "
+                    f"risk={cfg['risk_per_trade']*100:.2f}% "
+                    f"hardATR={cfg['hard_stop_atr_mult']:.2f} trailATR={cfg['trail_atr_mult']:.2f}"
+                )
 
         if not trading_enabled:
             telegram_send("\n".join(msgs))
