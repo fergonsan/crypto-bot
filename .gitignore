@@ -24,6 +24,8 @@ Thumbs.db
 
 # Backtest outputs
 backtest_out/
+backtest_out_*/
+backtest_risk*/
 
 # Env files
 .env
