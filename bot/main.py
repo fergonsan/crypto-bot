@@ -411,8 +411,8 @@ def main():
                 qty = position_size_usdc(
                     bot_equity, cfg["risk_per_trade"], float(atr14), float(close),
                     hard_stop_atr_mult=cfg["hard_stop_atr_mult"],
+                    max_notional_usdc=max_order_notional,
                 )
-                qty = min(qty, max_order_notional / float(close))
                 qty = min(qty, (bot_equity * max_asset_exposure_pct) / float(close))
                 qty = min(qty, (quote_free / float(close)) if float(close) > 0 else 0.0)
 

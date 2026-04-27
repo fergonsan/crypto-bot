@@ -10,6 +10,7 @@ def position_size_usdc(
     atr14: float,
     entry_price: float,
     hard_stop_atr_mult: float = 1.5,
+    max_notional_usdc: float | None = None,
 ) -> float:
     if equity_usdc <= 0 or risk_pct <= 0:
         return 0.0
@@ -25,4 +26,7 @@ def position_size_usdc(
     if stop_distance <= 0:
         return 0.0
 
-    return float(max(0.0, risk_usdc / stop_distance))
+    qty = risk_usdc / stop_distance
+    if max_notional_usdc is not None and entry_price > 0:
+        qty = min(qty, max_notional_usdc / entry_price)
+    return float(max(0.0, qty))
