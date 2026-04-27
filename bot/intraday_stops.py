@@ -182,6 +182,20 @@ def main():
                 continue
 
             if low <= stop_level:
+                # Race condition fix: verificar qty con lock antes de vender
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT qty FROM positions WHERE symbol=%s FOR UPDATE",
+                        (sym,),
+                    )
+                    row = cur.fetchone()
+                    locked_qty = float(row[0] or 0) if row else 0.0
+                if locked_qty <= 0:
+                    conn.commit()
+                    msgs.append(f"⚠️ {sym}: intraday stop evitado (qty ya=0).")
+                    continue
+                qty = locked_qty
+
                 executed = (not DRY_RUN)
                 if executed:
                     order = ex.create_market_sell_order(sym, qty)
@@ -197,9 +211,13 @@ def main():
                         "VALUES(%s,'sell',%s,%s,%s,%s)",
                         (sym, qty, price, notional, "stop_intraday_low"),
                     )
+                    cur.execute(
+                        "UPDATE positions SET qty=0,avg_price=NULL,entry_time=NULL,"
+                        "peak_close=0,hard_stop=0,trail_stop=0,updated_at=NOW() "
+                        "WHERE symbol=%s",
+                        (sym,),
+                    )
                 conn.commit()
-
-                close_position(conn, sym)
                 msgs.append(
                     f"🛑 STOP {sym} qty={qty:.8f} px~{price:.4f} "
                     f"notional~{notional:.2f} low~{low:.4f} stop~{stop_level:.4f} "

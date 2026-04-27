@@ -308,6 +308,20 @@ def main():
                     )
 
                     if float(close) < stop_level:
+                        # Race condition fix: verificar qty con lock antes de vender
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT qty FROM positions WHERE symbol=%s FOR UPDATE",
+                                (symbol,),
+                            )
+                            row = cur.fetchone()
+                            locked_qty = float(row[0] or 0) if row else 0.0
+                        if locked_qty <= 0:
+                            conn.commit()
+                            msgs.append(f"⚠️ {symbol}: stop_daily evitado (qty ya=0).")
+                            continue
+                        bot_qty = locked_qty
+
                         executed = (not DRY_RUN)
                         if executed:
                             order = ex.create_market_sell_order(symbol, bot_qty)
@@ -322,10 +336,14 @@ def main():
                                 "VALUES(%s,'sell',%s,%s,%s,%s)",
                                 (symbol, bot_qty, price, notional, "stop_close_daily"),
                             )
+                            cur.execute(
+                                "UPDATE positions SET qty=0,avg_price=NULL,entry_time=NULL,"
+                                "peak_close=0,hard_stop=0,trail_stop=0,updated_at=NOW() "
+                                "WHERE symbol=%s",
+                                (symbol,),
+                            )
                         conn.commit()
 
-                        upsert_bot_position(conn, symbol, 0.0, None, entry_time=None,
-                                            peak_close=0.0, hard_stop=0.0, trail_stop=0.0)
                         msgs.append(
                             f"🛑 STOP(daily close) {symbol} qty={bot_qty:.8f} "
                             f"px~{price:.4f} stop~{stop_level:.4f} "
@@ -342,6 +360,20 @@ def main():
 
             # Exit por señal
             if bot_qty > 0 and d["exit_signal"]:
+                # Race condition fix: verificar qty con lock antes de vender
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT qty FROM positions WHERE symbol=%s FOR UPDATE",
+                        (symbol,),
+                    )
+                    row = cur.fetchone()
+                    locked_qty = float(row[0] or 0) if row else 0.0
+                if locked_qty <= 0:
+                    conn.commit()
+                    msgs.append(f"⚠️ {symbol}: exit_signal evitado (qty ya=0).")
+                    continue
+                bot_qty = locked_qty
+
                 executed = (not DRY_RUN)
                 if executed:
                     order = ex.create_market_sell_order(symbol, bot_qty)
@@ -356,10 +388,14 @@ def main():
                         "VALUES(%s,'sell',%s,%s,%s,%s)",
                         (symbol, bot_qty, price, notional, "exit_signal_or_regime_off"),
                     )
+                    cur.execute(
+                        "UPDATE positions SET qty=0,avg_price=NULL,entry_time=NULL,"
+                        "peak_close=0,hard_stop=0,trail_stop=0,updated_at=NOW() "
+                        "WHERE symbol=%s",
+                        (symbol,),
+                    )
                 conn.commit()
 
-                upsert_bot_position(conn, symbol, 0.0, None, entry_time=None,
-                                    peak_close=0.0, hard_stop=0.0, trail_stop=0.0)
                 msgs.append(
                     f"🔻 SELL {symbol} qty={bot_qty:.8f} px~{price:.4f} "
                     f"({'LIVE' if executed else 'PAPER'})"
