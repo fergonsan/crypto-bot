@@ -194,7 +194,7 @@ def main():
             if s not in ALLOWLIST:
                 raise RuntimeError(f"Symbol {s} fuera de allowlist.")
 
-        today = dt.datetime.utcnow().date()
+        today = dt.datetime.now(dt.timezone.utc).date()
 
         bot_equity = get_bot_equity_usdc(conn, ex, SYMBOLS)
         with conn.cursor() as cur:
@@ -392,7 +392,7 @@ def main():
                     price = float(close)
 
                 notional = qty * price
-                entry_time = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+                entry_time = dt.datetime.now(dt.timezone.utc)
                 hard_stop = float(price) - (cfg["hard_stop_atr_mult"] * float(atr14))
                 peak_close = float(price)
                 trail_stop = peak_close - (cfg["trail_atr_mult"] * float(atr14))

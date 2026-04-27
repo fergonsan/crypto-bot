@@ -155,7 +155,7 @@ def main():
                 last = float(ticker.get("last") or 0.0)
                 high = last
                 low = last
-                cts = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+                cts = dt.datetime.now(dt.timezone.utc)
             else:
                 high = float(candle["high"])
                 low = float(candle["low"])
